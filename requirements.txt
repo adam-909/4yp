@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+matplotlib
+python-dateutil
+jupyter
+ipykernel
+networkx
+torch
+wrds
+tqdm
+pyarrow
