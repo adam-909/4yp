@@ -11,6 +11,8 @@ from .splits import (
     apply_split_adjustment,
     get_split_dates,
     load_cfacpr_data,
+    get_cfacpr_for_date,
+    compute_split_adjusted_strike,
 )
 
 from .portfolio import (
@@ -47,6 +49,8 @@ __all__ = [
     'apply_split_adjustment',
     'get_split_dates',
     'load_cfacpr_data',
+    'get_cfacpr_for_date',
+    'compute_split_adjusted_strike',
     # Portfolio
     'get_portfolio_formation_days',
     'compute_delta_neutral_weights',

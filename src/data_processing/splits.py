@@ -137,6 +137,78 @@ def get_split_dates(
     return split_dates
 
 
+def get_cfacpr_for_date(
+    cfacpr_data: pd.DataFrame,
+    ticker: str,
+    target_date: pd.Timestamp
+) -> Optional[float]:
+    """
+    Get the cfacpr value for a specific ticker and date.
+
+    Uses exact date match first, then falls back to the most recent
+    available date before target_date.
+
+    Args:
+        cfacpr_data: DataFrame with cfacpr values (index=date, columns=tickers)
+        ticker: Ticker symbol
+        target_date: Date to look up
+
+    Returns:
+        cfacpr value or None if not available
+    """
+    if ticker not in cfacpr_data.columns:
+        return None
+
+    target_date_norm = pd.Timestamp(target_date).normalize()
+    cfacpr_index_norm = pd.to_datetime(cfacpr_data.index).normalize()
+
+    # Try exact match first
+    exact_match = cfacpr_index_norm == target_date_norm
+    if exact_match.any():
+        idx = cfacpr_data.index[exact_match][0]
+        return cfacpr_data.loc[idx, ticker]
+
+    # Fall back to most recent date before target
+    earlier_dates = cfacpr_data.index[cfacpr_index_norm < target_date_norm]
+    if len(earlier_dates) > 0:
+        return cfacpr_data.loc[earlier_dates[-1], ticker]
+
+    return None
+
+
+def compute_split_adjusted_strike(
+    original_strike: float,
+    pfd_cfacpr: float,
+    current_cfacpr: float
+) -> float:
+    """
+    Compute the split-adjusted strike price.
+
+    When a stock splits, strike prices are adjusted by the split ratio.
+    For example, a 4-for-1 split would divide the strike by 4.
+
+    Args:
+        original_strike: Strike price selected at PFD
+        pfd_cfacpr: cfacpr value at PFD
+        current_cfacpr: cfacpr value at current date
+
+    Returns:
+        Split-adjusted strike price
+    """
+    if pfd_cfacpr is None or current_cfacpr is None:
+        return original_strike
+
+    # split_ratio = old_cfacpr / new_cfacpr
+    # For a 4-for-1 split: pfd_cfacpr=4, current_cfacpr=1, ratio=4
+    # new_strike = old_strike / ratio = 450 / 4 = 112.5
+    split_ratio = pfd_cfacpr / current_cfacpr
+
+    if abs(split_ratio - 1.0) < 0.001:
+        return original_strike
+
+    return original_strike / split_ratio
+
+
 def load_cfacpr_data(
     equity_prices_path: str,
     security_names_path: str,

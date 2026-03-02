@@ -76,46 +76,47 @@ def stitch_price_series(
     debug: bool = False
 ) -> pd.Series:
     """
-    Stitch front and back month price series to avoid PnL jumps.
+    Stitch using a SAME-DAY anchor (avoid Fri-vs-Mon scaling that compounds to ~0).
 
-    Uses ratio adjustment to maintain continuity at the roll date.
-
-    Args:
-        front_prices: Front month price series
-        back_prices: Back month price series
-        roll_date: Date of the roll
-        debug: If True, print debug info
-
-    Returns:
-        Stitched price series
+    1) Prefer using roll_date itself if both sides have a price.
+    2) Otherwise, use the earliest date >= roll_date where BOTH have non-NaN.
+    3) Scale back from that anchor date onward, and keep front up to that date inclusive.
     """
-    roll_date_norm = pd.Timestamp(roll_date).normalize()
-    front_index_norm = pd.to_datetime(front_prices.index).normalize()
-    back_index_norm = pd.to_datetime(back_prices.index).normalize()
+    roll = pd.Timestamp(roll_date).normalize()
 
-    front_at_roll = front_prices[front_index_norm == roll_date_norm]
-    back_at_roll = back_prices[back_index_norm == roll_date_norm]
+    # ensure normalized datetime index
+    f = front_prices.copy()
+    b = back_prices.copy()
+    f.index = pd.to_datetime(f.index).normalize()
+    b.index = pd.to_datetime(b.index).normalize()
 
-    front_roll = front_at_roll.iloc[0] if len(front_at_roll) > 0 else np.nan
-    back_roll = back_at_roll.iloc[0] if len(back_at_roll) > 0 else np.nan
+    # candidate dates where both are available on/after roll
+    common = f.loc[f.index >= roll].dropna().index.intersection(b.loc[b.index >= roll].dropna().index)
 
-    front_before = front_prices[front_index_norm < roll_date_norm]
-    back_after = back_prices[back_index_norm >= roll_date_norm]
+    if len(common) == 0:
+        # no same-day anchor available -> just concatenate without scaling
+        return pd.concat([f.loc[f.index < roll], b.loc[b.index >= roll]]).sort_index()
+
+    anchor_date = common[0]
+    front_anchor = f.loc[anchor_date]
+    back_anchor = b.loc[anchor_date]
+
+    if pd.isna(front_anchor) or pd.isna(back_anchor) or back_anchor == 0:
+        return pd.concat([f.loc[f.index < roll], b.loc[b.index >= roll]]).sort_index()
+
+    ratio = front_anchor / back_anchor
 
     if debug:
-        print(f"    stitch: front={len(front_prices)}, back={len(back_prices)}, "
-              f"front_before={len(front_before)}, back_after={len(back_after)}")
+        print(f"stitch roll={roll.date()} anchor={anchor_date.date()} front={front_anchor:.6g} back={back_anchor:.6g} ratio={ratio:.6g}")
 
-    if np.isnan(front_roll) or np.isnan(back_roll) or back_roll == 0:
-        return pd.concat([front_before, back_after])
+    # keep front THROUGH anchor_date
+    front_keep = f.loc[f.index <= anchor_date]
 
-    ratio = front_roll / back_roll
-    adjusted_back = back_prices * ratio
-    adjusted_back_after = adjusted_back[back_index_norm >= roll_date_norm]
+    # scale back FROM anchor_date (and then drop the duplicate anchor point from back to avoid double-counting)
+    back_scaled = b.loc[b.index >= anchor_date] * ratio
+    back_scaled = back_scaled.loc[back_scaled.index > anchor_date]
 
-    stitched = pd.concat([front_before, adjusted_back_after])
-    return stitched.sort_index()
-
+    return pd.concat([front_keep, back_scaled]).sort_index()
 
 def backfill_missing_ema(prices: pd.Series, span: int = 5) -> pd.Series:
     """

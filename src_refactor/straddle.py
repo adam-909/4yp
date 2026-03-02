@@ -23,6 +23,37 @@ from .utils import (
 )
 
 
+def get_cfacpr_for_date(cfacpr_series: pd.Series, target_date: pd.Timestamp) -> float:
+    """Get cfacpr for a date, using backward fill if exact date not found."""
+    if cfacpr_series is None:
+        return None
+
+    target_date_norm = pd.Timestamp(target_date).normalize()
+
+    # Try exact match
+    if target_date_norm in cfacpr_series.index:
+        return cfacpr_series.loc[target_date_norm]
+
+    # Backward fill - find most recent date before target
+    earlier = cfacpr_series.index[cfacpr_series.index < target_date_norm]
+    if len(earlier) > 0:
+        return cfacpr_series.loc[earlier[-1]]
+
+    return None
+
+
+def compute_split_adjusted_strike(original_strike: float, pfd_cfacpr: float, current_cfacpr: float) -> float:
+    """Compute split-adjusted strike price."""
+    if pfd_cfacpr is None or current_cfacpr is None:
+        return original_strike
+
+    split_ratio = pfd_cfacpr / current_cfacpr
+    if abs(split_ratio - 1.0) < 0.001:
+        return original_strike
+
+    return original_strike / split_ratio
+
+
 def get_portfolio_formation_days(
     start_date: str,
     end_date: str
@@ -140,18 +171,11 @@ def process_single_asset_v2(
     4. ±3 day lookahead for PFD data
     5. Delta required only at PFD
 
-    Args:
-        options_data: DataFrame with option quotes (must have 'ticker' column)
-        equity_prices: DataFrame with underlying equity prices (index=dates, columns=tickers)
-        asset_id: Ticker symbol for the underlying asset
-        pfds: List of portfolio formation dates
-        min_coverage: Minimum data coverage required (default 95%)
-        return_metadata: If True, also return strike/expiry/spot data
-        debug: If True, print detailed debug info
-
-    Returns:
-        Tuple of (straddle_prices, straddle_returns, metadata) or (None, None, None)
+    + FIX: robust split stitching
+      - treat split like a roll: stitch on the FIRST valid post-split quote,
+        not necessarily on the split effective date.
     """
+    cfacpr_series = None
     period_prices = {}
     all_metadata = []
 
@@ -163,7 +187,7 @@ def process_single_asset_v2(
             print(f"  {asset_id}: No options found")
         return None, None, None
 
-    # FIX FOR CONCERN 2: Use equity index as trading calendar
+    # Use equity index as trading calendar
     trading_calendar = equity_prices.index
 
     # Debug counters
@@ -180,8 +204,7 @@ def process_single_asset_v2(
         next_pfd = pfds[i + 1]
         pfd_ts = pd.Timestamp(pfd)
 
-        # Get spot price at PFD
-        # FIX: Use trading calendar for lookup
+        # Get spot price at PFD (using trading calendar)
         pfd_idx = trading_calendar[trading_calendar >= pfd_ts]
         if len(pfd_idx) == 0:
             debug_no_spot += 1
@@ -199,11 +222,8 @@ def process_single_asset_v2(
 
         debug_pfd_count += 1
 
-        # NEW APPROACH: Find best (expiry, strike) combination from PFD-day quotes
-        # This ensures we select options that actually have quotes on PFD day
-
         # Step 1: Get options quoted on or near PFD (±3 days)
-        offsets = [0] + [i for j in range(1, 4) for i in (j, -j)]
+        offsets = [0] + [k for j in range(1, 4) for k in (j, -j)]
         pfd_day_options = None
         actual_pfd_date = pfd
 
@@ -230,10 +250,7 @@ def process_single_asset_v2(
         moneyness[call_mask] = spot / pfd_day_options.loc[call_mask, 'strike']
         moneyness[put_mask] = pfd_day_options.loc[put_mask, 'strike'] / spot
 
-        pfd_options_atm = pfd_day_options[
-            (moneyness >= 0.9) & (moneyness <= 1.1)
-        ]
-
+        pfd_options_atm = pfd_day_options[(moneyness >= 0.9) & (moneyness <= 1.1)]
         if pfd_options_atm.empty:
             debug_no_options += 1
             continue
@@ -244,7 +261,6 @@ def process_single_asset_v2(
         target_month_end = (target_month_start + relativedelta(months=1)) - pd.Timedelta(days=1)
         next_pfd_ts = pd.Timestamp(next_pfd)
 
-        # Filter to expirations in target window
         pfd_options_exp = pfd_options_atm[
             (pfd_options_atm['exdate'] >= target_month_start) &
             (pfd_options_atm['exdate'] <= target_month_end)
@@ -260,7 +276,6 @@ def process_single_asset_v2(
                 debug_no_expiry += 1
                 continue
 
-        # Find valid (expiry, strike) combinations with call+put and delta
         valid_combos = []
         for exdate_candidate in pfd_options_exp['exdate'].unique():
             exp_opts = pfd_options_exp[pfd_options_exp['exdate'] == exdate_candidate]
@@ -285,14 +300,11 @@ def process_single_asset_v2(
             debug_no_calls_puts += 1
             continue
 
-        # Step 4: Select best combo - prefer expiry >= next_pfd, then closest to ATM
+        # Step 4: Select best combo
         combos_after_next_pfd = [c for c in valid_combos if pd.Timestamp(c['exdate']) >= next_pfd_ts]
-
         if combos_after_next_pfd:
-            # Among expiries >= next_pfd, take earliest expiry, then closest strike
             best = min(combos_after_next_pfd, key=lambda c: (c['exdate'], c['dist_to_spot']))
         else:
-            # No expiry >= next_pfd, take latest expiry, then closest strike
             best = max(valid_combos, key=lambda c: (c['exdate'], -c['dist_to_spot']))
 
         exdate = best['exdate']
@@ -309,107 +321,150 @@ def process_single_asset_v2(
             debug_no_calls_puts += 1
             continue
 
-        # FIX FOR CONCERN 2: Use actual trading days from equity calendar
-        # Now that we select expiry >= next_pfd, the period covers PFD to next_pfd
+        # Use actual trading days from equity calendar for the period
         period_start = pfd_ts
         period_end = pd.Timestamp(next_pfd)
         trading_days = trading_calendar[
             (trading_calendar >= period_start) &
-            (trading_calendar < period_end)  # Up to but not including next PFD
+            (trading_calendar < period_end)
         ]
 
         period_data = {}
 
+        # Split detection baseline
+        pfd_cfacpr = get_cfacpr_for_date(cfacpr_series, pfd_ts) if cfacpr_series is not None else None
+
+        active_strike = atm_strike
+        prev_cfacpr = pfd_cfacpr
+        last_valid_price = None
+
+        price_adjustment_ratio = 1.0  # cumulative factor applied to raw straddle_price
+
+        # NEW: pending split stitch state (stitch on first VALID post-split quote)
+        pending_split = False
+        pre_split_price = None  # last valid *adjusted* price before split
+
         for day in trading_days:
             day_options = asset_options_all[asset_options_all['date'] == day]
 
-            # FIX FOR CONCERN 1 & 5: Don't skip - we'll reindex later
-            # Just try to get prices if available
-            call_day = day_options[
-                (day_options['cp_flag'] == 'C') &
-                (day_options['strike'] == atm_strike) &
-                (day_options['exdate'] == exdate)
+            current_cfacpr = get_cfacpr_for_date(cfacpr_series, day) if cfacpr_series is not None else None
+
+            split_occurred = False
+            day_split_ratio = 1.0
+            if prev_cfacpr is not None and current_cfacpr is not None:
+                day_split_ratio = prev_cfacpr / current_cfacpr
+                if abs(day_split_ratio - 1.0) > 0.001:
+                    split_occurred = True
+                    # Update strike tracking
+                    active_strike = active_strike / day_split_ratio
+                    # Keep old "economic scaling" update (harmless when combined with stitch)
+                    price_adjustment_ratio *= day_split_ratio
+
+                    # Mark split as pending; we will stitch on first valid post-split quote
+                    pending_split = True
+                    pre_split_price = last_valid_price
+
+            # Filter to correct expiration
+            day_exp_options = day_options[day_options['exdate'] == exdate]
+            if day_exp_options.empty:
+                period_data[day] = np.nan
+                prev_cfacpr = current_cfacpr
+                continue
+
+            # Find nearest available strike to our active strike
+            available_strikes = day_exp_options['strike'].unique()
+            if len(available_strikes) > 0:
+                closest_strike = min(available_strikes, key=lambda x: abs(x - active_strike))
+                if abs(closest_strike - active_strike) / active_strike > 0.05:
+                    period_data[day] = np.nan
+                    prev_cfacpr = current_cfacpr
+                    continue
+                active_strike = closest_strike
+
+            call_day = day_exp_options[
+                (day_exp_options['cp_flag'] == 'C') &
+                (day_exp_options['strike'] == active_strike)
             ]
-            put_day = day_options[
-                (day_options['cp_flag'] == 'P') &
-                (day_options['strike'] == atm_strike) &
-                (day_options['exdate'] == exdate)
+            put_day = day_exp_options[
+                (day_exp_options['cp_flag'] == 'P') &
+                (day_exp_options['strike'] == active_strike)
             ]
 
             if call_day.empty or put_day.empty:
-                # FIX FOR CONCERN 1: Keep day in period but with NaN
                 period_data[day] = np.nan
+                prev_cfacpr = current_cfacpr
                 continue
 
             call_mid = (call_day.iloc[0]['best_bid'] + call_day.iloc[0]['best_offer']) / 2
             put_mid = (put_day.iloc[0]['best_bid'] + put_day.iloc[0]['best_offer']) / 2
             straddle_price = w_call * call_mid + w_put * put_mid
 
-            # SPLIT ADJUSTMENT: Divide by cfacpr to get split-adjusted price
-            if cfacpr_series is not None and day in cfacpr_series.index:
-                cfacpr = cfacpr_series.loc[day]
-                if pd.notna(cfacpr) and cfacpr > 0:
-                    straddle_price = straddle_price / cfacpr
+            # NEW: if a split happened recently, stitch on FIRST valid post-split quote
+            if pending_split and pre_split_price is not None and not np.isnan(straddle_price) and straddle_price != 0:
+                # Make adjusted_price continuous: pre_split_price == straddle_price * price_adjustment_ratio (after update)
+                price_adjustment_ratio *= (pre_split_price / (straddle_price * price_adjustment_ratio))
+                pending_split = False
+                pre_split_price = None
 
-            period_data[day] = straddle_price
+            adjusted_price = straddle_price * price_adjustment_ratio
+
+            period_data[day] = adjusted_price
+            last_valid_price = adjusted_price
+            prev_cfacpr = current_cfacpr
 
             if return_metadata:
                 current_spot = equity_prices.loc[day, asset_id] if day in equity_prices.index else spot
                 all_metadata.append({
                     'date': day,
-                    'strike': atm_strike,
+                    'strike': active_strike,
                     'exdate': exdate,
                     'spot': current_spot
                 })
 
         if period_data:
             period_series = pd.Series(period_data)
-            # FIX FOR CONCERN 1: Reindex to full trading calendar for this period
             period_series = period_series.reindex(trading_days)
             period_prices[pfd] = period_series
         else:
             debug_no_data += 1
 
-    # Print debug summary
     total_pfds = len(pfds) - 1
     if debug:
-        print(f"    {asset_id}: PFDs={debug_pfd_count}/{total_pfds}, "
-              f"no_spot={debug_no_spot}, no_opts={debug_no_options}, "
-              f"no_exp={debug_no_expiry}, no_strike={debug_no_strike}, "
-              f"no_cp={debug_no_calls_puts}, no_data={debug_no_data}, "
-              f"used_offset={debug_used_offset}, periods={len(period_prices)}")
+        print(
+            f"    {asset_id}: PFDs={debug_pfd_count}/{total_pfds}, "
+            f"no_spot={debug_no_spot}, no_opts={debug_no_options}, "
+            f"no_exp={debug_no_expiry}, no_strike={debug_no_strike}, "
+            f"no_cp={debug_no_calls_puts}, no_data={debug_no_data}, "
+            f"used_offset={debug_used_offset}, periods={len(period_prices)}"
+        )
 
     if not period_prices:
         return None, None, None
 
-    # Stitch price series
+    # Stitch price series across rolls
     sorted_pfds = sorted(period_prices.keys())
-
     if len(sorted_pfds) == 1:
         stitched_prices = period_prices[sorted_pfds[0]]
     else:
         stitched_prices = period_prices[sorted_pfds[0]].copy()
-
-        for i in range(1, len(sorted_pfds)):
-            roll_date = sorted_pfds[i]
+        for j in range(1, len(sorted_pfds)):
+            roll_date = sorted_pfds[j]
             back_prices = period_prices[roll_date]
-
             stitched_prices = stitch_price_series(
                 front_prices=stitched_prices,
                 back_prices=back_prices,
                 roll_date=roll_date,
-                debug=debug and i < 3
+                debug=debug and j < 3
             )
 
     prices = stitched_prices.sort_index()
 
-    # FIX FOR CONCERN 2: Use actual trading calendar for expected days
+    # Full calendar for coverage check
     full_calendar = trading_calendar[
         (trading_calendar >= pd.Timestamp(pfds[0])) &
         (trading_calendar <= pd.Timestamp(pfds[-1]))
     ]
 
-    # FIX FOR CONCERN 1: Reindex to full calendar BEFORE coverage check
     prices = prices.reindex(full_calendar)
 
     expected_days = len(full_calendar)
@@ -417,14 +472,16 @@ def process_single_asset_v2(
     actual_coverage = actual_days / expected_days
 
     if debug:
-        print(f"      -> {asset_id} coverage: {actual_days}/{expected_days} = {actual_coverage:.1%} "
-              f"(need {min_coverage:.0%})")
+        print(
+            f"      -> {asset_id} coverage: {actual_days}/{expected_days} = {actual_coverage:.1%} "
+            f"(need {min_coverage:.0%})"
+        )
 
     if actual_coverage < min_coverage:
         return None, None, None
 
-    # Fill missing with EMA (Algorithm 1, Line 18)
-    prices = backfill_missing_ema(prices, span=5)
+    # Fill missing with EMA
+    # prices = backfill_missing_ema(prices, span=5)
 
     # Compute returns
     returns = prices.pct_change()

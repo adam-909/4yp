@@ -12,6 +12,7 @@ from dateutil.relativedelta import relativedelta
 
 from .portfolio import compute_delta_neutral_weights
 from .options import select_atm_strike, filter_by_moneyness
+from .splits import get_cfacpr_for_date, compute_split_adjusted_strike
 
 
 def stitch_price_series(
@@ -228,20 +229,54 @@ def process_single_asset(
         period_data = []
 
         for day in trading_days:
-            day_options = asset_options[asset_options['date'] == day]
+            # Handle stock splits: adjust strike if cfacpr changed since PFD
+            current_strike = atm_strike
+            split_ratio = 1.0
+
+            if cfacpr_data is not None and asset_id in cfacpr_data.columns:
+                current_cfacpr = get_cfacpr_for_date(cfacpr_data, asset_id, day)
+                if pfd_cfacpr is not None and current_cfacpr is not None:
+                    split_ratio = pfd_cfacpr / current_cfacpr
+                    if abs(split_ratio - 1.0) > 0.001:
+                        current_strike = compute_split_adjusted_strike(
+                            atm_strike, pfd_cfacpr, current_cfacpr
+                        )
+
+            # Use UNFILTERED options when looking up post-split
+            # (the moneyness filter was applied at PFD spot, which is different post-split)
+            if abs(split_ratio - 1.0) > 0.001:
+                day_options = asset_options_all[asset_options_all['date'] == day]
+            else:
+                day_options = asset_options[asset_options['date'] == day]
 
             if day_options.empty:
                 continue
 
-            call_day = day_options[
-                (day_options['cp_flag'] == 'C') &
-                (day_options['strike'] == atm_strike) &
-                (day_options['exdate'] == exdate)
+            # Find options with the (possibly adjusted) strike
+            # Filter to the correct expiration first
+            day_exp_options = day_options[day_options['exdate'] == exdate]
+
+            if day_exp_options.empty:
+                continue
+
+            # Get available strikes for this expiration
+            available_strikes = day_exp_options['strike'].unique()
+
+            # Find the closest available strike to our target
+            if len(available_strikes) > 0:
+                closest_strike = min(available_strikes, key=lambda x: abs(x - current_strike))
+                # Only use if within 5% (to avoid tracking completely wrong strikes)
+                if abs(closest_strike - current_strike) / current_strike > 0.05:
+                    continue
+                current_strike = closest_strike
+
+            call_day = day_exp_options[
+                (day_exp_options['cp_flag'] == 'C') &
+                (day_exp_options['strike'] == current_strike)
             ]
-            put_day = day_options[
-                (day_options['cp_flag'] == 'P') &
-                (day_options['strike'] == atm_strike) &
-                (day_options['exdate'] == exdate)
+            put_day = day_exp_options[
+                (day_exp_options['cp_flag'] == 'P') &
+                (day_exp_options['strike'] == current_strike)
             ]
 
             if call_day.empty or put_day.empty:
@@ -256,12 +291,17 @@ def process_single_asset(
             put_mid = (put_day.iloc[0]['best_bid'] + put_day.iloc[0]['best_offer']) / 2
             straddle_price = w_call * call_mid + w_put * put_mid
 
+            # Note: Do NOT multiply by split_ratio here.
+            # Post-split, we track the economically equivalent contract at the adjusted strike.
+            # Option prices are already adjusted by the OCC, so the quoted prices are correct.
+            # The stitching logic at PFD boundaries handles price level transitions.
+
             period_data.append({'date': day, 'price': straddle_price})
 
             if return_metadata:
                 all_metadata.append({
                     'date': day,
-                    'strike': atm_strike,
+                    'strike': current_strike,  # Store actual strike used
                     'exdate': exdate,
                     'spot': current_spot
                 })
