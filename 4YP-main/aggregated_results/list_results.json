@@ -1,0 +1,18 @@
+{
+    "ALL": {
+        "annual_return": [],
+        "annual_volatility": [],
+        "sharpe_ratio": [],
+        "downside_risk": [],
+        "sortino_ratio": [],
+        "max_drawdown": [],
+        "calmar_ratio": [],
+        "perc_pos_return": [],
+        "profit_loss_ratio": [],
+        "annual_return_rescaled": [],
+        "annual_volatility_rescaled": [],
+        "downside_risk_rescaled": [],
+        "max_drawdown_rescaled": [],
+        "sharpe_ratio_years": []
+    }
+}

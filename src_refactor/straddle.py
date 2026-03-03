@@ -175,7 +175,7 @@ def process_single_asset_v2(
       - treat split like a roll: stitch on the FIRST valid post-split quote,
         not necessarily on the split effective date.
     """
-    cfacpr_series = None
+    # NOTE: cfacpr_series is passed as parameter - DO NOT override it!
     period_prices = {}
     all_metadata = []
 
@@ -480,7 +480,14 @@ def process_single_asset_v2(
     if actual_coverage < min_coverage:
         return None, None, None
 
-    # Fill missing with EMA
+    # NORMALIZE: Scale so final price = 1 (like original implementation)
+    # This prevents exponential decay in ratio-stitched prices
+    # Note: Returns are scale-invariant so this doesn't affect them
+    final_price = prices.dropna().iloc[-1] if len(prices.dropna()) > 0 else 1.0
+    if final_price != 0 and not np.isnan(final_price):
+        prices = prices / final_price
+
+    # Fill missing with EMA (optional)
     # prices = backfill_missing_ema(prices, span=5)
 
     # Compute returns

@@ -1,0 +1,284 @@
+from typing import List
+import numpy as np
+import pandas as pd
+import os
+import networkx as nx
+from networkx.algorithms.community import louvain_communities, modularity
+import matplotlib.pyplot as plt
+
+# Import your data loading function and settings.
+from data.pull_data import pull_equities_sample_data, pull_straddle_sample_data
+from settings.default import ALL_TICKERS, BBG_SECTORS
+
+# Define thresholds to evaluate
+COMPUTE_ALL = False
+ALL_THRESHOLD_VALUES = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7]
+EQUITY = True
+
+# Define sector colors (feel free to adjust colors as needed)
+sector_colors = {
+    "Technology": "deepskyblue",
+    "Health Care": "green",
+    "Financials": "red",
+    "Real Estate": "purple",
+    "Consumer Discretionary": "orange",
+    "Communication Services": "cyan",
+    "Industrials": "brown",
+    "Consumer Staples": "yellow",
+    "Energy": "pink",
+    "Materials": "gray",
+    "Utilities": "lightblue",
+}
+
+def compute_pearson_log_returns_adjacency(tickers: List[str], data_loader, threshold: float):
+    """
+    For each ticker, load its data and compute log returns. Then,
+    calculate the Pearson correlation matrix and create a binary
+    adjacency matrix (no self loops) based on the threshold.
+    """
+    log_return_dict = {}
+    for ticker in tickers:
+        df = data_loader(ticker)
+        if "price" not in df.columns:
+            raise ValueError(f"No 'price' column found for {ticker}.")
+        # Compute log returns
+        df["log_return"] = np.log(df["price"]).diff()
+        log_return_dict[ticker] = df["log_return"]
+
+    log_returns_df = pd.DataFrame(log_return_dict)
+    log_returns_df.dropna(how="all", inplace=True)
+    corr_matrix = log_returns_df.corr(method="pearson")
+    adjacency_matrix = (corr_matrix.abs() >= threshold).astype(int)
+    # Remove self-loops
+    np.fill_diagonal(adjacency_matrix.values, 0)
+
+    n = adjacency_matrix.shape[0]
+    total_possible_off_diagonal = n * (n - 1)
+    ones_count = adjacency_matrix.values.sum()
+    density = ones_count / total_possible_off_diagonal if total_possible_off_diagonal > 0 else 0
+    print(f"Threshold: {threshold} | Graph density (excluding self loops): {ones_count}/{total_possible_off_diagonal} = {density:.4f}")
+
+    return log_returns_df, corr_matrix, adjacency_matrix
+
+def compute_edge_homophily_ratio(adjacency_matrix: pd.DataFrame, ticker_labels: dict) -> float:
+    """
+    Computes the edge homophily ratio for the constructed graph.
+    """
+    tickers = adjacency_matrix.index
+    same_label_edges = 0
+    total_edges = 0
+    for i in range(len(tickers)):
+        for j in range(i + 1, len(tickers)):
+            if adjacency_matrix.iloc[i, j] == 1:
+                total_edges += 1
+                if ticker_labels[tickers[i]] == ticker_labels[tickers[j]]:
+                    same_label_edges += 1
+    return same_label_edges / total_edges if total_edges > 0 else 0
+
+# Lists to store computed metrics.
+edge_homophily_ratios = []
+no_of_edges_present = []
+edge_percentages = []
+louvain_modularity_scores = []
+thresholds_record = []
+
+
+if COMPUTE_ALL:
+    # Dictionary to store community partitions for each threshold.
+    partitions_by_threshold = {}
+
+    # Loop over each threshold to compute metrics and save edge lists for Gephi.
+    for threshold in ALL_THRESHOLD_VALUES:
+        _, _, adjacency_matrix = compute_pearson_log_returns_adjacency(
+            tickers=ALL_TICKERS,
+            data_loader=pull_equities_sample_data if EQUITY else pull_straddle_sample_data,
+            threshold=threshold,
+        )
+        
+        # Create a NetworkX graph from the adjacency matrix.
+        G = nx.from_pandas_adjacency(adjacency_matrix)
+        
+        # Save the edge list as a CSV file for Gephi.
+        edge_list = []
+        for u, v, data in G.edges(data=True):
+            weight = data.get('weight', 1)
+            edge_list.append({'Source': str(u), 'Target': str(v), 'Weight': weight})
+        df_edge_list = pd.DataFrame(edge_list)
+        df_edge_list.to_csv(f"gephi_edges_{threshold}.csv", index=False)
+        
+        # Count undirected edges (each edge appears twice in the matrix)
+        ones_count = adjacency_matrix.values.sum()
+        num_edges = int(ones_count / 2)
+        edge_homophily_ratio = compute_edge_homophily_ratio(adjacency_matrix, BBG_SECTORS)
+        
+        n = adjacency_matrix.shape[0]
+        total_possible_edges = n * (n - 1) / 2
+        edge_percentage = (num_edges / total_possible_edges) * 100 if total_possible_edges > 0 else 0
+        
+        # Compute Louvain communities with resolution=1.
+        communities = louvain_communities(G, resolution=20)
+        modularity_score = modularity(G, communities, weight='weight')
+        
+        # Convert communities to a partition dictionary.
+        partition = {}
+        for comm_index, comm in enumerate(communities):
+            for node in comm:
+                partition[str(node)] = comm_index
+        partitions_by_threshold[threshold] = partition
+
+        thresholds_record.append(threshold)
+        no_of_edges_present.append(num_edges)
+        edge_homophily_ratios.append(edge_homophily_ratio)
+        edge_percentages.append(edge_percentage)
+        louvain_modularity_scores.append(modularity_score)
+
+    # Save the node attributes (ticker and sector) for Gephi.
+    df_bbg = pd.DataFrame(list(BBG_SECTORS.items()), columns=["Id", "Sector"])
+    df_bbg["Label"] = df_bbg["Id"]  # Use ticker as the label
+    df_bbg["Id"] = df_bbg["Id"].astype(str)
+    df_bbg.to_csv("gephi_bbg_sectors.csv", index=False)
+
+    # Create and save a summary DataFrame.
+    results_df = pd.DataFrame({
+        "Threshold": thresholds_record,
+        "Number of Edges": no_of_edges_present,
+        "Edge Homophily Ratio": edge_homophily_ratios,
+        "Edge Percentage": edge_percentages,
+        "Louvain Modularity Score": louvain_modularity_scores
+    })
+    print("\nFinal Results:")
+    print(results_df)
+    results_df.to_csv("gephi_summary_results.csv", index=False)
+
+    # Plot the metrics vs. threshold.
+    edge_percentage_fraction = [ep / 100.0 for ep in edge_percentages]
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds_record, edge_homophily_ratios, color="blue", marker='o', label='Edge Homophily Ratio')
+    plt.plot(thresholds_record, edge_percentage_fraction, color="cyan", marker='s', label='Edge Percentage')
+    plt.plot(thresholds_record, louvain_modularity_scores, color="purple", marker='^', label='Louvain Modularity Score')
+    plt.axvline(x=0.6, color="red", linestyle="--")  # Vertical dashed red line at x = 0.6
+    plt.xlabel('Threshold')
+    plt.ylabel('Metric Value')
+    plt.title('Metrics vs. Threshold')
+    plt.xlim(0.3, 0.7)
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.grid(False)
+    plt.show()
+
+    # Print the partitions by threshold.
+    print("\nPartitions by Threshold:")
+    print(partitions_by_threshold)
+
+# -------------------------------
+# Visualization using graph layout (adapted from your first code)
+# -------------------------------
+
+# Select one threshold to visualize (for example, 0.6)
+selected_threshold = 0.45
+_, _, adjacency_matrix = compute_pearson_log_returns_adjacency(
+    tickers=ALL_TICKERS,
+    data_loader=pull_equities_sample_data,
+    threshold=selected_threshold,
+)
+# Create graph from the adjacency matrix.
+G = nx.from_pandas_adjacency(adjacency_matrix)
+
+# Compute Louvain communities with resolution=1.
+communities = louvain_communities(G, resolution=1)
+community_assignments = {}
+for comm_id, community in enumerate(communities):
+    for node in community:
+        community_assignments[node] = comm_id
+
+# Use the nodes as they are in G.
+labels = {node: node for node in G.nodes()}
+predicted_labels = [community_assignments.get(node, -1) for node in G.nodes()]
+node_sector_colors = [sector_colors.get(BBG_SECTORS.get(node, "Other"), "gray") for node in G.nodes()]
+
+# Use Kamada-Kawai layout for positioning.
+pos = nx.kamada_kawai_layout(G)
+# Normalize positions to fill the plot area (from -2 to 2 on both axes).
+x_vals = [p[0] for p in pos.values()]
+y_vals = [p[1] for p in pos.values()]
+x_min, x_max = min(x_vals), max(x_vals)
+y_min, y_max = min(y_vals), max(y_vals)
+for node in pos:
+    pos[node] = (
+        (pos[node][0] - x_min) / (x_max - x_min) * 4 - 2,
+        (pos[node][1] - y_min) / (y_max - y_min) * 4 - 2,
+    )
+
+# Create side-by-side plots.
+fig, axes = plt.subplots(1, 2, figsize=(12, 8))
+
+# ----- Left Plot: Nodes colored by Sector -----
+nx.draw_networkx_nodes(
+    G,
+    pos=pos,
+    nodelist=list(G.nodes()),
+    node_size=400,
+    node_color=node_sector_colors,
+    edgecolors="black",
+    alpha=0.9,
+    ax=axes[0],
+)
+nx.draw_networkx_edges(
+    G,
+    pos=pos,
+    edge_color="gray",
+    alpha=0.6,
+    width=0.8,
+    ax=axes[0],
+)
+nx.draw_networkx_labels(
+    G,
+    pos=pos,
+    labels=labels,
+    font_size=10,
+    font_color="black",
+    # font_weight="bold",
+    ax=axes[0],
+)
+legend_elements = [
+    plt.Line2D([0], [0], marker="o", color="w", label=sector, markerfacecolor=color, markersize=12)
+    for sector, color in sector_colors.items()
+]
+axes[0].legend(handles=legend_elements, loc="upper left", title="Sectors")
+axes[0].set_title(f"Pearson Correlation Graph\n(Threshold: {selected_threshold})", fontsize=22)
+axes[0].axis("off")
+
+# ----- Right Plot: Nodes colored by Louvain Communities -----
+nx.draw_networkx_nodes(
+    G,
+    pos=pos,
+    nodelist=list(G.nodes()),
+    node_size=400,
+    node_color=predicted_labels,
+    cmap=plt.cm.Set3,
+    edgecolors="black",
+    alpha=0.9,
+    ax=axes[1],
+)
+nx.draw_networkx_edges(
+    G,
+    pos=pos,
+    edge_color="gray",
+    alpha=0.6,
+    width=0.8,
+    ax=axes[1],
+)
+nx.draw_networkx_labels(
+    G,
+    pos=pos,
+    labels=labels,
+    font_size=10,
+    font_color="black",
+    # font_weight="bold",
+    ax=axes[1],
+)
+axes[1].set_title("Graph Clustering: Louvain Communities", fontsize=22)
+axes[1].axis("off")
+
+plt.tight_layout()
+plt.show()
