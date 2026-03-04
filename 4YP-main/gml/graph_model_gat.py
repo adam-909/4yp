@@ -219,34 +219,40 @@ class SparseGATLSTMDeepMomentumNetwork(GraphDeepMomentumNetwork):
         stacked_lstm = layers.Lambda(lambda tensors: tf.stack(tensors, axis=2))(lstm_outputs)
         print("Stacked LSTM output shape:", stacked_lstm.shape)
 
-        # Apply Sparse GAT layers
+        # Apply Sparse GAT layers with Layer Normalization
+        # Layer 1: concat heads for expressiveness
         gat_output = GraphAttentionLayer(
             units=gat_units,
             attn_heads=attn_heads,
             adjacency=self.A,
-            concat_heads=True,
+            concat_heads=True,  # Concat for intermediate layer
             use_sparse=True,
             dropout_rate=dropout_rate,
             name="sparse_gat_1"
         )(stacked_lstm)
+        gat_output = layers.LayerNormalization()(gat_output)  # Add layer norm
         gat_output = layers.ReLU()(gat_output)
         print("After Sparse GAT 1, shape:", gat_output.shape)
 
         if num_gat_layers == 2:
+            # Layer 2 (final): average heads for stability
             gat_output = GraphAttentionLayer(
                 units=gat_units,
                 attn_heads=attn_heads,
                 adjacency=self.A,
-                concat_heads=True,
+                concat_heads=False,  # Average for final layer
                 use_sparse=True,
                 dropout_rate=dropout_rate,
                 name="sparse_gat_2"
             )(gat_output)
+            gat_output = layers.LayerNormalization()(gat_output)  # Add layer norm
             gat_output = layers.ReLU()(gat_output)
             print("After Sparse GAT 2, shape:", gat_output.shape)
+            gat_output_dim = gat_units  # Averaged heads = single unit dimension
+        else:
+            gat_output_dim = gat_units * attn_heads  # Concatenated = units * heads
 
         # Residual connection
-        gat_output_dim = gat_units * attn_heads
         residual = layers.TimeDistributed(
             layers.TimeDistributed(
                 keras.layers.Dense(gat_output_dim, activation="linear")
@@ -324,34 +330,40 @@ class FullGATLSTMDeepMomentumNetwork(GraphDeepMomentumNetwork):
         stacked_lstm = layers.Lambda(lambda tensors: tf.stack(tensors, axis=2))(lstm_outputs)
         print("Stacked LSTM output shape:", stacked_lstm.shape)
 
-        # Apply Full GAT layers (no adjacency mask)
+        # Apply Full GAT layers with Layer Normalization (no adjacency mask)
+        # Layer 1: concat heads for expressiveness
         gat_output = GraphAttentionLayer(
             units=gat_units,
             attn_heads=attn_heads,
             adjacency=None,  # No mask = full attention
-            concat_heads=True,
+            concat_heads=True,  # Concat for intermediate layer
             use_sparse=False,
             dropout_rate=dropout_rate,
             name="full_gat_1"
         )(stacked_lstm)
+        gat_output = layers.LayerNormalization()(gat_output)  # Add layer norm
         gat_output = layers.ReLU()(gat_output)
         print("After Full GAT 1, shape:", gat_output.shape)
 
         if num_gat_layers == 2:
+            # Layer 2 (final): average heads for stability
             gat_output = GraphAttentionLayer(
                 units=gat_units,
                 attn_heads=attn_heads,
                 adjacency=None,
-                concat_heads=True,
+                concat_heads=False,  # Average for final layer
                 use_sparse=False,
                 dropout_rate=dropout_rate,
                 name="full_gat_2"
             )(gat_output)
+            gat_output = layers.LayerNormalization()(gat_output)  # Add layer norm
             gat_output = layers.ReLU()(gat_output)
             print("After Full GAT 2, shape:", gat_output.shape)
+            gat_output_dim = gat_units  # Averaged heads = single unit dimension
+        else:
+            gat_output_dim = gat_units * attn_heads  # Concatenated = units * heads
 
         # Residual connection
-        gat_output_dim = gat_units * attn_heads
         residual = layers.TimeDistributed(
             layers.TimeDistributed(
                 keras.layers.Dense(gat_output_dim, activation="linear")
