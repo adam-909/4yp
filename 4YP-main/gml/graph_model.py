@@ -106,7 +106,7 @@ from spektral.layers import GCNConv
 #                               kernel_constraint=keras.constraints.max_norm(3))(X_2)
 
 #         model = keras.Model(inputs=X_in, outputs=output)
-#         adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+#         adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
 #         sharpe_loss = SharpeLoss(self.output_size).call
 #         model.compile(loss=sharpe_loss, optimizer=adam, sample_weight_mode="temporal")
 #         return model
@@ -305,7 +305,7 @@ from spektral.layers import GCNConv
 #                                                      kernel_constraint=keras.constraints.max_norm(3)))(dropout_layer)
 
 #         model = keras.Model(inputs=[time_series_input, stock_index_input], outputs=output)
-#         adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+#         adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
 #         sharpe_loss = SharpeLoss(self.output_size).call
 #         model.compile(loss=sharpe_loss, optimizer=adam, sample_weight_mode="temporal")
 #         return model
@@ -569,7 +569,7 @@ class GraphDeepMomentumModel(DeepMomentumNetworkModel):
         )(graph_attention_out)
         # output shape: (batch, T, 90, output_size)
         model = keras.Model(inputs=input_layer, outputs=output)
-        adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+        adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
         sharpe_loss = SharpeLoss(self.output_size).call
         model.compile(
             loss=sharpe_loss,
@@ -676,7 +676,7 @@ class LstmGATDeepMomentumNetworkModel(DeepMomentumNetworkModel):
         model = keras.Model(inputs=input_layer, outputs=output)
         
         # Configure the optimizer with gradient clipping.
-        adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+        adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
         
         # Define the custom Sharpe loss function.
         sharpe_loss = SharpeLoss(self.output_size).call
@@ -834,7 +834,7 @@ class GCLstmDeepMomentumNetworkModel(DeepMomentumNetworkModel):
         model = keras.Model(inputs=input_layer, outputs=output)
 
         # 6) Configure the optimizer with gradient clipping.
-        adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+        adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
 
         # 7) Define the custom Sharpe loss function.
         sharpe_loss = SharpeLoss(self.output_size).call

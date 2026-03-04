@@ -7,7 +7,7 @@ import keras_tuner as kt
 # from keras_tuner import TunerCallback
 
 
-from keras_tuner.tuners.randomsearch import RandomSearch
+from keras_tuner import RandomSearch
 import copy
 from abc import ABC, abstractmethod
 
@@ -67,7 +67,7 @@ class SharpeValidationLoss(keras.callbacks.Callback):
         self.num_time = num_time
         self.min_delta = min_delta
 
-        self.best_sharpe = np.NINF  # since calculating positive Sharpe...
+        self.best_sharpe = -np.inf  # since calculating positive Sharpe...
         # self.best_weights = None
         self.weights_save_location = weights_save_location
         # self.verbose = verbose
@@ -78,14 +78,10 @@ class SharpeValidationLoss(keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         self.patience_counter = 0
         self.stopped_epoch = 0
-        self.best_sharpe = np.NINF
+        self.best_sharpe = -np.inf
 
     def on_epoch_end(self, epoch, logs=None):
-        positions = self.model.predict(
-            self.inputs,
-            workers=self.n_multiprocessing_workers,
-            use_multiprocessing=True,  # , batch_size=1
-        )
+        positions = self.model.predict(self.inputs)
         print(self.inputs.shape)
         print(positions.shape)
         print(self.returns.shape)
@@ -123,7 +119,7 @@ class SharpeValidationLoss(keras.callbacks.Callback):
 #     def _get_trial_dir(self, trial):
 #         return f"trial_{trial.trial_id[:5]}" 
 
-class TunerValidationLoss(kt.tuners.RandomSearch): # TODO changed
+class TunerValidationLoss(kt.RandomSearch): # TODO changed
     def __init__(
         self,
         hypermodel,
@@ -156,7 +152,7 @@ class TunerValidationLoss(kt.tuners.RandomSearch): # TODO changed
         super(TunerValidationLoss, self).run_trial(trial, *args, **kwargs)
 
 
-class TunerDiversifiedSharpe(kt.tuners.RandomSearch):
+class TunerDiversifiedSharpe(kt.RandomSearch):
     def __init__(
         self,
         hypermodel,
@@ -311,8 +307,6 @@ class DeepMomentumNetworkModel(ABC):
                 epochs=self.num_epochs,
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
         else:
             callbacks = [
@@ -330,12 +324,11 @@ class DeepMomentumNetworkModel(ABC):
                 validation_data=(val_data, val_labels, val_flags),
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
 
         best_hp = self.tuner.get_best_hyperparameters(num_trials=1)[0].values
-        best_model = self.tuner.get_best_models(num_models=1)[0]
+        # Build fresh model with best hyperparameters (get_best_models requires saved checkpoints)
+        best_model = self.load_model(best_hp)
 
         # Additional training to capture the training history (with both loss and val_loss)
         new_callbacks = [
@@ -353,8 +346,6 @@ class DeepMomentumNetworkModel(ABC):
             validation_data=(val_data, val_labels, val_flags),
             callbacks=new_callbacks,
             shuffle=True,
-            use_multiprocessing=True,
-            workers=self.n_multiprocessing_workers,
         )
         
         # Save the full training history including both loss and val_loss to a JSON file
@@ -407,8 +398,6 @@ class DeepMomentumNetworkModel(ABC):
                 batch_size=hyperparameters["batch_size"],
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
             model.load_weights(temp_folder)
         else:
@@ -435,8 +424,6 @@ class DeepMomentumNetworkModel(ABC):
                 ),
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
         return model
 
@@ -462,8 +449,6 @@ class DeepMomentumNetworkModel(ABC):
                 x=inputs,
                 y=outputs,
                 sample_weight=active_entries,
-                workers=32,
-                use_multiprocessing=True,
             )
 
             metrics = pd.Series(metric_values, model.metrics_names)
@@ -492,11 +477,7 @@ class DeepMomentumNetworkModel(ABC):
             returns = outputs.flatten()
         mask = (years >= years_geq) & (years < years_lt)
 
-        positions = model.predict(
-            inputs,
-            workers=self.n_multiprocessing_workers,
-            use_multiprocessing=True,  # , batch_size=1
-        )
+        positions = model.predict(inputs)
         if sliding_window:
             positions = positions[:, -1, 0].flatten()
         else:
@@ -580,7 +561,7 @@ class LstmDeepMomentumNetworkModel(DeepMomentumNetworkModel):
         model = keras.Model(inputs=input_layer, outputs=output)
 
         # Configure the optimizer with gradient clipping.
-        adam = keras.optimizers.Adam(lr=learning_rate, clipnorm=max_gradient_norm)
+        adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
 
         # Define the custom Sharpe loss function.
         sharpe_loss = SharpeLoss(self.output_size).call

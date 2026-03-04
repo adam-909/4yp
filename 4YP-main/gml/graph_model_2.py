@@ -38,7 +38,7 @@ from gml.deep_neural_network import DeepMomentumNetworkModel
 
 from tensorflow.keras import layers, optimizers, constraints
 
-from spektral.layers import GCNConv
+# from spektral.layers import GCNConv  # Not used - using custom GraphConvolution
 
 
 class GraphSharpeLoss(tf.keras.losses.Loss):
@@ -90,7 +90,7 @@ class GraphSharpeValidationLoss(keras.callbacks.Callback):
         self.num_time = num_time
         self.min_delta = min_delta
 
-        self.best_sharpe = np.NINF  # since calculating positive Sharpe...
+        self.best_sharpe = -np.inf  # since calculating positive Sharpe...
         self.weights_save_location = weights_save_location
 
     def set_weights_save_loc(self, weights_save_location):
@@ -99,15 +99,11 @@ class GraphSharpeValidationLoss(keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         self.patience_counter = 0
         self.stopped_epoch = 0
-        self.best_sharpe = np.NINF 
+        self.best_sharpe = -np.inf
 
     def on_epoch_end(self, epoch, logs=None):
 
-        positions = self.model.predict(
-            self.inputs,
-            workers=self.n_multiprocessing_workers,
-            use_multiprocessing=True,
-        )
+        positions = self.model.predict(self.inputs)
 
         # ???
         positions_flat = tf.reshape(positions, [-1])
@@ -158,7 +154,7 @@ class GraphSharpeValidationLoss(keras.callbacks.Callback):
         print(f"\nval_sharpe {logs['sharpe']}")
         
         
-class GraphTunerValidationLoss(kt.tuners.RandomSearch): # TODO changed
+class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
     def __init__(
         self,
         hypermodel,
@@ -191,7 +187,7 @@ class GraphTunerValidationLoss(kt.tuners.RandomSearch): # TODO changed
         super(GraphTunerValidationLoss, self).run_trial(trial, *args, **kwargs)
 
 
-class GraphTunerDiversifiedSharpe(kt.tuners.RandomSearch):
+class GraphTunerDiversifiedSharpe(kt.RandomSearch):
     def __init__(
         self,
         hypermodel,
@@ -383,8 +379,6 @@ class GraphDeepMomentumNetwork(ABC):
                 epochs=self.num_epochs,
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
         else:
             callbacks = [
@@ -402,16 +396,14 @@ class GraphDeepMomentumNetwork(ABC):
                 validation_data=(val_data, val_labels, val_flags),
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
 
         print("completed HP search")
         best_hp = self.tuner.get_best_hyperparameters(num_trials=1)[0].values
         print("best_hp:", best_hp)
-        
-        # get_best_models not working - weights not saved
-        best_model = self.tuner.get_best_models(num_models=1)[0]
+
+        # Build fresh model with best hyperparameters (get_best_models requires saved checkpoints)
+        best_model = self.load_model(best_hp)
         print("best_model:", best_model)
         
         # Additional training to record the training history.
@@ -431,8 +423,6 @@ class GraphDeepMomentumNetwork(ABC):
             validation_data=(val_data, val_labels, val_flags),
             callbacks=new_callbacks,
             shuffle=True,
-            use_multiprocessing=True,
-            workers=self.n_multiprocessing_workers,
         )
         
         return best_hp, best_model, training_history
@@ -480,8 +470,6 @@ class GraphDeepMomentumNetwork(ABC):
                 batch_size=hyperparameters["batch_size"],
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
             model.load_weights(temp_folder)
         else:
@@ -508,8 +496,6 @@ class GraphDeepMomentumNetwork(ABC):
                 ),
                 callbacks=callbacks,
                 shuffle=True,
-                use_multiprocessing=True,
-                workers=self.n_multiprocessing_workers,
             )
         return model
 
@@ -535,8 +521,6 @@ class GraphDeepMomentumNetwork(ABC):
                 x=inputs,
                 y=outputs,
                 sample_weight=active_entries,
-                workers=32,
-                use_multiprocessing=True,
             )
 
             metrics = pd.Series(metric_values, model.metrics_names)
@@ -571,11 +555,7 @@ class GraphDeepMomentumNetwork(ABC):
         
         mask = (years >= years_geq) & (years < years_lt)
         
-        positions = model.predict(
-            inputs,
-            workers=self.n_multiprocessing_workers,
-            use_multiprocessing=True,
-        )
+        positions = model.predict(inputs)
         if sliding_window:
             # Expect predictions to have shape: (batch, n_stocks, time_steps, 1)
             # Extract the final time step for each stock and flatten.

@@ -7,7 +7,7 @@ MODEL_PARAMS = {
     "early_stopping_patience": 25,
     "fill_blank_dates": False,
     "split_tickers_individually": True,
-    "random_search_iterations": 50 ,
+    "random_search_iterations": 1 ,
     "evaluate_diversified_val_sharpe": True,
     "train_valid_ratio": 0.80,
     "time_features": False,
@@ -23,7 +23,7 @@ MODEL_PARAMS_GRAPH = {
     "early_stopping_patience": 25,
     "fill_blank_dates": False,
     "split_tickers_individually": True,
-    "random_search_iterations": 50 , # -> 50
+    "random_search_iterations": 1 , # -> 50
     "evaluate_diversified_val_sharpe": True,
     "train_valid_ratio": 0.80,
     "time_features": False,
