@@ -11,7 +11,7 @@ from torch_geometric.data import Data
 from networkx.algorithms.community import louvain_communities, modularity
 
 
-df = pd.read_csv(r"C:\Users\Sean\Documents\gml-master\data\straddle_features\features.csv")
+df = pd.read_csv(r"data/straddle_features/features.csv")
 
 
 # =============================================================================

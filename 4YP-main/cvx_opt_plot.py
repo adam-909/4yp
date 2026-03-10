@@ -13,7 +13,7 @@ alpha = 100
 beta = 0.01
 
 # Build the full file path.
-path = r"C:\Users\Sean\Documents\gml-master\data\graph_structure\cvx_opt"
+path = r"data/graph_structure/cvx_opt"
 csv_file = os.path.join(path, f"{alpha}_{beta}_cvx.csv")
 
 # Read the CSV file. Assumes that the first column in the CSV contains ticker names.

@@ -201,7 +201,7 @@ for alpha_val in alpha_grid:
         # =============================================================================
         # 4. Apply Graph Normalization to the Ensemble
         # =============================================================================
-        A_ensem5ble_np = A_ensemble.cpu().numpy()
+        A_ensemble_np = A_ensemble.cpu().numpy()
         row_sum = A_ensemble_np.sum(axis=1)
         row_sum[row_sum == 0] = 1e-8
         D_inv_sqrt = np.diag(1.0 / np.sqrt(row_sum))
