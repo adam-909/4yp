@@ -403,7 +403,8 @@ class GraphDeepMomentumNetwork(ABC):
         print("best_hp:", best_hp)
 
         # Build fresh model with best hyperparameters (get_best_models requires saved checkpoints)
-        best_model = self.load_model(best_hp)
+        #best_model = self.load_model(best_hp)
+        best_model = self.tuner.get_best_models(num_models=1)[0]
         print("best_model:", best_model)
         
         # Additional training to record the training history.
@@ -419,7 +420,7 @@ class GraphDeepMomentumNetwork(ABC):
             x=data,
             y=labels,
             sample_weight=active_flags,
-            epochs=self.num_epochs,
+            epochs=50,
             validation_data=(val_data, val_labels, val_flags),
             callbacks=new_callbacks,
             shuffle=True,
