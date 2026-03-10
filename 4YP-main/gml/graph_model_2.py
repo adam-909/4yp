@@ -184,7 +184,7 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
         kwargs["batch_size"] = trial.hyperparameters.Choice(
             "batch_size", values=self.hp_minibatch_size
         )
-        super(GraphTunerValidationLoss, self).run_trial(trial, *args, **kwargs)
+        return super(GraphTunerValidationLoss, self).run_trial(trial, *args, **kwargs)
 
 
 class GraphTunerDiversifiedSharpe(kt.RandomSearch):
