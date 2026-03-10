@@ -149,7 +149,7 @@ class TunerValidationLoss(kt.RandomSearch): # TODO changed
         kwargs["batch_size"] = trial.hyperparameters.Choice(
             "batch_size", values=self.hp_minibatch_size
         )
-        super(TunerValidationLoss, self).run_trial(trial, *args, **kwargs)
+        return super(TunerValidationLoss, self).run_trial(trial, *args, **kwargs)
 
 
 class TunerDiversifiedSharpe(kt.RandomSearch):
@@ -571,7 +571,7 @@ class LstmDeepMomentumNetworkModel(DeepMomentumNetworkModel):
         model.compile(
             loss=sharpe_loss,
             optimizer=adam,
-            sample_weight_mode="temporal",
+            #sample_weight_mode="temporal",
         )
         
         model.summary()

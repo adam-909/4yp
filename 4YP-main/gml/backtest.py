@@ -403,6 +403,7 @@ def run_single_window(
         Exception: [description]
     """
     directory = _get_directory_name(experiment_name, train_interval)
+    os.makedirs(directory, exist_ok=True)
 
     if skip_if_completed and os.path.exists(os.path.join(directory, "results.json")):
         print(
@@ -613,7 +614,9 @@ def run_single_window(
 
     # save model and get rid of the hp dir
     best_directory = os.path.join(directory, "best")
-    best_model.save_weights(os.path.join(best_directory, "checkpoints", "checkpoint.weights.h5"))
+    checkpoints_directory = os.path.join(best_directory, "checkpoints")
+    os.makedirs(checkpoints_directory, exist_ok=True)
+    best_model.save_weights(os.path.join(checkpoints_directory, "checkpoint.weights.h5"))
     with open(os.path.join(best_directory, "hyperparameters.json"), "w") as file:
         file.write(json.dumps(best_hp, indent=4))
     shutil.rmtree(hp_directory)
@@ -1053,6 +1056,7 @@ def run_classical_methods(
             # --- Scaled Signal ---
             data_scaled = base_returns_data.copy()
             data_scaled["position"] = intermediate_momentum_position(momentum_val, data_scaled)
+            data_scaled["captured_returns"] = data_scaled["position"] * data_scaled["returns"]
             # Apply scaling based on the annual volatility performance metric.
             data_scaled = scale_position(data_scaled, target_vol=0.15)
             data_scaled = data_scaled.reset_index(drop=True)
@@ -1098,6 +1102,7 @@ def run_classical_methods(
         # --- Scaled Signal ---
         data_scaled = base_returns_data.copy()
         data_scaled["position"] = 1.0
+        data_scaled["captured_returns"] = data_scaled["position"] * data_scaled["returns"]
         data_scaled = scale_position(data_scaled, target_vol=0.15)
         data_scaled = data_scaled.reset_index(drop=True)
         
@@ -1142,6 +1147,7 @@ def run_classical_methods(
         # --- Scaled Signal ---
         data_scaled = base_returns_data.copy()
         data_scaled["position"] = -1.0
+        data_scaled["captured_returns"] = data_scaled["position"] * data_scaled["returns"]
         data_scaled = scale_position(data_scaled, target_vol=0.15)
         data_scaled = data_scaled.reset_index(drop=True)
         

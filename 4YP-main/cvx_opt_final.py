@@ -41,7 +41,7 @@ feature_columns = [
 ]
 
 # Read the feature CSV.
-df = pd.read_csv(r"C:\Users\Sean\Documents\gml-master\data\straddle_features\features.csv")
+df = pd.read_csv(r"/home/adam/new4YP/4YP-main/data/straddle_features/features.csv")
 df['date'] = pd.to_datetime(df['date'])
 
 
