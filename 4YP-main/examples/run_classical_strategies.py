@@ -13,7 +13,7 @@ INTERVALS = [(2011, 2017, 2023)]
 
 # Graph ML Strategy
 # REFERENCE_EXPERIMENT = "experiment_graph_split80_gml_cpnone_len63_notime_div_v1"
-REFERENCE_EXPERIMENT = "exp_lstm_split60_lstm_cpnone_len20_notime_val_v1"
+REFERENCE_EXPERIMENT = "quick_test"
 
 if STRADDLE:
     features_file_path = os.path.join(
