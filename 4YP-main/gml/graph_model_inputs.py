@@ -798,24 +798,29 @@ class RollingGraphModelFeatures(GraphModelFeatures):
         adjacencies = []
 
         for window_idx in range(num_windows):
-            # Get the end date for this window (last time step of first ticker)
-            # We use the date from the first ticker (column 0) as reference
+            # Use the day BEFORE the window starts to avoid look-ahead bias
+            # This ensures adjacency only contains information available before the window
             window_dates = dates[window_idx, 0, :]  # (time_steps,)
-            end_date = window_dates[-1]  # Last date in window
+            window_start_date = window_dates[0]  # First date in window
 
-            # Find the position of end_date in the returns index
+            # Find the position of window_start_date in the returns index
             try:
-                end_pos = returns_pivot.index.get_loc(end_date)
+                window_start_pos = returns_pivot.index.get_loc(window_start_date)
             except KeyError:
-                # If exact date not found, use nearest
-                end_pos = returns_pivot.index.searchsorted(end_date)
-                end_pos = min(end_pos, len(returns_pivot) - 1)
+                window_start_pos = returns_pivot.index.searchsorted(window_start_date)
+                window_start_pos = min(window_start_pos, len(returns_pivot) - 1)
+
+            # End position is ONE DAY BEFORE the window starts (no look-ahead)
+            end_pos = window_start_pos - 1
 
             # Compute start position based on lookback
             start_pos = max(0, end_pos - self.correlation_lookback + 1)
 
-            # Get returns for this lookback period
-            lookback_returns = returns_pivot.iloc[start_pos:end_pos + 1]
+            # Get returns for this lookback period (entirely before the window)
+            if end_pos >= start_pos and end_pos >= 0:
+                lookback_returns = returns_pivot.iloc[start_pos:end_pos + 1]
+            else:
+                lookback_returns = pd.DataFrame()  # Not enough historical data
 
             # Handle case where we don't have enough data
             if len(lookback_returns) < 2:
