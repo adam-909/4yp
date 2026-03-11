@@ -34,6 +34,10 @@ HP_BETA = [0.01]#0.01, 0.1, 1.0, 10.0]
 # GAT-specific hyperparameters
 HP_ATTN_HEADS = [4]  # Number of attention heads [2, 4, 8]
 
+# Rolling Pearson graph hyperparameters
+HP_CORRELATION_LOOKBACK = [20, 40, 60]  # Time steps for correlation window
+HP_CORRELATION_THRESHOLD = [0.3, 0.4, 0.5, 0.6]  # Tau threshold for adjacency
+
 
 # HP_HIDDEN_LAYER_SIZE = [20]
 # HP_DROPOUT_RATE = [0.1]

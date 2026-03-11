@@ -6,6 +6,7 @@ from tensorflow import keras
 import keras_tuner as kt
 import copy
 import os
+import matplotlib.pyplot as plt
 
 from abc import ABC, abstractmethod
 
@@ -18,6 +19,8 @@ from settings.hp_grid import (
     HP_GCN_UNITS,
     HP_ALPHA,
     HP_BETA,
+    HP_CORRELATION_LOOKBACK,
+    HP_CORRELATION_THRESHOLD,
 )
 from settings.default import ALL_TICKERS
 # from gml.model_inputs import ModelFeatures
@@ -168,7 +171,7 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
         **kwargs,
     ):
         self.hp_minibatch_size = hp_minibatch_size
-        # self._reported_step = 0 # TECKY
+        self._trained_models = {}  # Store trained models in memory
         super().__init__(
             hypermodel,
             objective,
@@ -184,7 +187,29 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
         kwargs["batch_size"] = trial.hyperparameters.Choice(
             "batch_size", values=self.hp_minibatch_size
         )
-        return super(GraphTunerValidationLoss, self).run_trial(trial, *args, **kwargs)
+        # Add restore_best_weights to keep best weights in memory
+        original_callbacks = kwargs.get("callbacks", [])
+        for cb in original_callbacks:
+            if isinstance(cb, tf.keras.callbacks.EarlyStopping):
+                cb.restore_best_weights = True
+
+        # Build and train model, then store in memory
+        model = self.hypermodel.build(trial.hyperparameters)
+        history = model.fit(*args, **kwargs)
+        self._trained_models[trial.trial_id] = model
+        return history
+
+    def get_best_models(self, num_models=1):
+        """Return models from memory instead of loading from disk."""
+        best_trials = self.oracle.get_best_trials(num_models)
+        models = []
+        for trial in best_trials:
+            if trial.trial_id in self._trained_models:
+                models.append(self._trained_models[trial.trial_id])
+            else:
+                # Fallback to parent method if not in memory
+                models.append(super().load_model(trial))
+        return models
 
 
 class GraphTunerDiversifiedSharpe(kt.RandomSearch):
@@ -201,7 +226,7 @@ class GraphTunerDiversifiedSharpe(kt.RandomSearch):
         **kwargs,
     ):
         self.hp_minibatch_size = hp_minibatch_size
-        # self._reported_step = 0 # TECKY
+        self._trained_models = {}  # Store trained models in memory
 
         super().__init__(
             hypermodel,
@@ -232,22 +257,30 @@ class GraphTunerDiversifiedSharpe(kt.RandomSearch):
 
         # Run the training process multiple times.
         metrics = collections.defaultdict(list)
+        best_model = None
         for execution in range(self.executions_per_trial):
             copied_fit_kwargs = copy.copy(kwargs)
             callbacks = self._deepcopy_callbacks(original_callbacks)
             self._configure_tensorboard_dir(callbacks, trial, execution)
             callbacks.append(kt.engine.tuner_utils.TunerCallback(self, trial))
-            # Only checkpoint the best epoch across all executions.
-            # callbacks.append(model_checkpoint)
             copied_fit_kwargs["callbacks"] = callbacks
 
-            history = self._build_and_fit_model(trial, args, copied_fit_kwargs)
+            # Build model explicitly so we can store it
+            model = self.hypermodel.build(trial.hyperparameters)
+            history = model.fit(*args, **copied_fit_kwargs)
+
             for metric, epoch_values in history.history.items():
                 if self.oracle.objective.direction == "min":
                     best_value = np.min(epoch_values)
                 else:
                     best_value = np.max(epoch_values)
                 metrics[metric].append(best_value)
+
+            # Keep the last trained model
+            best_model = model
+
+        # Store the trained model in memory
+        self._trained_models[trial.trial_id] = best_model
 
         # Average the results across executions and send to the Oracle.
         averaged_metrics = {}
@@ -256,6 +289,18 @@ class GraphTunerDiversifiedSharpe(kt.RandomSearch):
         self.oracle.update_trial(
             trial.trial_id, metrics=averaged_metrics, step=self._reported_step
         )
+
+    def get_best_models(self, num_models=1):
+        """Return models from memory instead of loading from disk."""
+        best_trials = self.oracle.get_best_trials(num_models)
+        models = []
+        for trial in best_trials:
+            if trial.trial_id in self._trained_models:
+                models.append(self._trained_models[trial.trial_id])
+            else:
+                # Fallback to parent method if not in memory
+                models.append(super().load_model(trial))
+        return models
 
 
 class GraphDeepMomentumNetwork(ABC):
@@ -402,31 +447,16 @@ class GraphDeepMomentumNetwork(ABC):
         best_hp = self.tuner.get_best_hyperparameters(num_trials=1)[0].values
         print("best_hp:", best_hp)
 
-        # Build fresh model with best hyperparameters (get_best_models requires saved checkpoints)
-        #best_model = self.load_model(best_hp)
+        # Get the already-trained best model (not a fresh one with random weights)
         best_model = self.tuner.get_best_models(num_models=1)[0]
-        print("best_model:", best_model)
-        
-        # Additional training to record the training history.
-        # This may further fine-tune the best model and record epoch-by-epoch metrics.
-        new_callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor="val_loss",
-                patience=self.early_stopping_patience,
-                min_delta=1e-4,
-            )
-        ]
-        training_history = best_model.fit(
-            x=data,
-            y=labels,
-            sample_weight=active_flags,
-            epochs=50,
-            validation_data=(val_data, val_labels, val_flags),
-            callbacks=new_callbacks,
-            shuffle=True,
-        )
-        
-        return best_hp, best_model, training_history
+        print("best_model loaded from HP search")
+
+        # Just evaluate, no fine-tuning
+        train_loss = best_model.evaluate(data, labels, sample_weight=active_flags, verbose=0)
+        val_loss = best_model.evaluate(val_data, val_labels, sample_weight=val_flags, verbose=0)
+        print(f"Loaded model - train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}")
+
+        return best_hp, best_model, {"train_loss": train_loss, "val_loss": val_loss}
 
     def load_model(
         self,
@@ -878,7 +908,179 @@ class GraphLSTMDeepMomentumNetwork(GraphDeepMomentumNetwork):
         
 #         # model.summary()
 #         return model
-    
+
+
+class DynamicGraphConvolution(layers.Layer):
+    """
+    Graph Convolution layer that accepts per-sample adjacency matrices.
+
+    Unlike GraphConvolution which stores a static adjacency matrix,
+    this layer receives the adjacency matrix as an input tensor,
+    allowing different graphs per sample in the batch.
+
+    Inputs (as a list):
+        - node_features: (batch_size, time_steps, num_stocks, input_dim)
+        - adjacency: (batch_size, num_stocks, num_stocks)
+
+    Output: (batch_size, time_steps, num_stocks, units)
+    """
+    def __init__(self, units, **kwargs):
+        super(DynamicGraphConvolution, self).__init__(**kwargs)
+        self.units = units
+
+    def build(self, input_shape):
+        # input_shape is a list: [node_features_shape, adjacency_shape]
+        features_shape = input_shape[0]
+        input_dim = features_shape[-1]
+        self.weight = self.add_weight(
+            shape=(input_dim, self.units),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="dynamic_gcn_weight",
+        )
+        self.bias = self.add_weight(
+            shape=(self.units,),
+            initializer="zeros",
+            trainable=True,
+            name="dynamic_gcn_bias",
+        )
+        super(DynamicGraphConvolution, self).build(input_shape)
+
+    def call(self, inputs):
+        # inputs is a list: [node_features, adjacency]
+        node_features, adjacency = inputs
+        # node_features: (batch, time_steps, num_stocks, input_dim)
+        # adjacency: (batch, num_stocks, num_stocks)
+
+        # Expand adjacency for time dimension: (batch, 1, num_stocks, num_stocks)
+        A_expanded = tf.expand_dims(adjacency, 1)
+
+        # Perform graph convolution per time step
+        # Ax: (batch, time_steps, num_stocks, input_dim)
+        Ax = tf.matmul(A_expanded, node_features)
+
+        # Linear transform
+        output = tf.matmul(Ax, self.weight) + self.bias
+        return output
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"units": self.units})
+        return config
+
+
+class RollingGraphLSTMDeepMomentumNetwork(GraphDeepMomentumNetwork):
+    """
+    LSTM-GCN model that uses per-sample rolling Pearson correlation graphs.
+
+    Instead of a single static adjacency matrix, this model accepts
+    a batch of adjacency matrices (one per sample) computed from
+    rolling correlation windows.
+    """
+    def __init__(self, project_name, hp_directory, hp_minibatch_size=HP_MINIBATCH_SIZE_GRAPH, **params):
+        super().__init__(project_name, hp_directory, hp_minibatch_size, **params)
+
+    def model_builder(self, hp):
+        # Hyperparameter selections for the network
+        hidden_layer_size = hp.Choice("hidden_layer_size", values=HP_HIDDEN_LAYER_SIZE_GRAPH)
+        dropout_rate      = hp.Choice("dropout_rate",      values=HP_DROPOUT_RATE_GRAPH)
+        max_gradient_norm = hp.Choice("max_gradient_norm", values=HP_MAX_GRADIENT_NORM_GRAPH)
+        learning_rate     = hp.Choice("learning_rate",     values=HP_LEARNING_RATE_GRAPH)
+        gcn_units         = hp.Choice("gcn_units",         values=HP_GCN_UNITS)
+        num_gcn_layers    = hp.Choice("gcn_layers",        values=[2])
+
+        # Rolling Pearson hyperparameters (stored for reference, actual computation done in data prep)
+        correlation_lookback  = hp.Choice("correlation_lookback",  values=HP_CORRELATION_LOOKBACK)
+        correlation_threshold = hp.Choice("correlation_threshold", values=HP_CORRELATION_THRESHOLD)
+
+        # Input layers: features AND adjacency matrix
+        feature_input = keras.Input(
+            shape=(self.num_tickers, self.time_steps, self.input_size),
+            name="features"
+        )
+        adjacency_input = keras.Input(
+            shape=(self.num_tickers, self.num_tickers),
+            name="adjacency"
+        )
+
+        # Define a shared LSTM layer that will be reused for all tickers
+        shared_lstm = layers.LSTM(
+            hidden_layer_size,
+            return_sequences=True,
+            dropout=dropout_rate,
+            activation="tanh",
+            recurrent_activation="sigmoid",
+            name="shared_lstm"
+        )
+
+        lstm_outputs = []
+        for i in range(self.num_tickers):
+            # Slice the input to get (batch_size, time_steps, input_size) for ticker i
+            ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(feature_input)
+
+            # Process the slice through the shared LSTM layer
+            ticker_output = shared_lstm(ticker_slice)
+            lstm_outputs.append(ticker_output)
+
+        # Stack the LSTM outputs along a new ticker dimension
+        # Shape: (batch_size, time_steps, num_tickers, hidden_layer_size)
+        stacked_lstm = layers.Lambda(lambda tensors: tf.stack(tensors, axis=2))(lstm_outputs)
+        print("Stacked LSTM output shape:", stacked_lstm.shape)
+
+        # Apply the Dynamic GCN layer with per-sample adjacency
+        gcn_output = DynamicGraphConvolution(units=gcn_units)([stacked_lstm, adjacency_input])
+        gcn_output = layers.ReLU()(gcn_output)
+        print("After GCN, shape:", gcn_output.shape)
+
+        if num_gcn_layers == 2:
+            gcn_output = DynamicGraphConvolution(units=gcn_units)([gcn_output, adjacency_input])
+            gcn_output = layers.ReLU()(gcn_output)
+
+        # Add a residual connection
+        residual = layers.TimeDistributed(
+                        layers.TimeDistributed(
+                            keras.layers.Dense(gcn_units, activation="linear")
+                        )
+                   )(stacked_lstm)
+        print("Residual shape:", residual.shape)
+
+        x = layers.Add()([gcn_output, residual])
+        print("After adding residual, shape:", x.shape)
+
+        # Apply nested TimeDistributed Dense layer for output
+        output = layers.TimeDistributed(
+                    layers.TimeDistributed(
+                        keras.layers.Dense(
+                            self.output_size,
+                            activation=tf.nn.tanh,
+                            kernel_constraint=keras.constraints.max_norm(3),
+                        )
+                    )
+                 )(x)
+
+        # Permute to match label shape: (batch_size, num_tickers, time_steps, output_size)
+        output = layers.Permute((2, 1, 3))(output)
+
+        # Create the model with two inputs
+        model = keras.Model(
+            inputs=[feature_input, adjacency_input],
+            outputs=output
+        )
+        print("Final model feature input shape:", feature_input.shape)
+        print("Final model adjacency input shape:", adjacency_input.shape)
+        print("Final model output shape:", output.shape)
+
+        # Configure the optimizer with gradient clipping
+        adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+        sharpe_loss = GraphSharpeLoss(self.output_size).call
+
+        model.compile(
+            loss=sharpe_loss,
+            optimizer=adam,
+        )
+
+        return model
+
     
     
     

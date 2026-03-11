@@ -248,7 +248,14 @@ class GraphModelFeatures(ModelFeatures):
         and dimension 3 enumerates features.
         """
         data = data.copy()
-        data["date"] = data.index.strftime("%Y-%m-%d")
+
+        # Handle date column: either from DatetimeIndex or existing column
+        if isinstance(data.index, pd.DatetimeIndex):
+            data["date"] = data.index.strftime("%Y-%m-%d")
+        elif "date" in data.columns:
+            # Ensure date is string format for consistency
+            if pd.api.types.is_datetime64_any_dtype(data["date"]):
+                data["date"] = data["date"].dt.strftime("%Y-%m-%d")
 
         id_col = get_single_col_by_input_type(InputTypes.ID, self._column_definition)
         time_col = get_single_col_by_input_type(InputTypes.TIME, self._column_definition)
@@ -626,3 +633,227 @@ class GraphModelFeatures(ModelFeatures):
 #             data_map[k] = data_map[k][valid_mask]
 
 #         return data_map
+
+
+class RollingGraphModelFeatures(GraphModelFeatures):
+    """
+    Extends GraphModelFeatures to compute rolling Pearson correlation
+    adjacency matrices for each sample window.
+
+    In addition to the standard batched data, this class also generates
+    per-sample adjacency matrices based on rolling correlation windows.
+    """
+
+    def __init__(
+        self,
+        df,
+        total_time_steps,
+        correlation_lookback=20,
+        correlation_threshold=0.5,
+        returns_column="daily_returns",
+        **kwargs
+    ):
+        """
+        Args:
+            df: Input DataFrame with features
+            total_time_steps: Number of time steps per sample (default 20)
+            correlation_lookback: Number of time steps to use for correlation (20, 40, 60)
+            correlation_threshold: Threshold for Pearson correlation (tau)
+            returns_column: Column name containing returns for correlation computation
+            **kwargs: Additional arguments passed to parent class
+        """
+        self.correlation_lookback = correlation_lookback
+        self.correlation_threshold = correlation_threshold
+        self.returns_column = returns_column
+        # Store the full dataframe for adjacency computation
+        self._full_df = df.copy()
+        super().__init__(df, total_time_steps, **kwargs)
+
+    def _batch_data(self, data, sliding_window):
+        """
+        Override parent's _batch_data to also compute rolling adjacency matrices.
+        """
+        # Call parent's _batch_data
+        data_map = super()._batch_data(data, sliding_window)
+
+        # Compute rolling adjacency matrices using the stored full dataframe
+        adjacencies = self._compute_rolling_adjacencies(data, data_map, sliding_window)
+        data_map["adjacency"] = adjacencies
+
+        print("adjacency.shape:", data_map["adjacency"].shape)
+
+        return data_map
+
+    def _compute_correlation_matrix(self, returns_df):
+        """
+        Compute Pearson correlation matrix from returns DataFrame.
+
+        Args:
+            returns_df: DataFrame of shape (lookback, num_tickers)
+
+        Returns:
+            Correlation matrix of shape (num_tickers, num_tickers)
+        """
+        corr = returns_df.corr().values
+        corr = np.nan_to_num(corr, nan=0.0)
+        return corr
+
+    def _build_adjacency_from_correlation(self, corr_matrix):
+        """
+        Build adjacency matrix from correlation using threshold.
+
+        Args:
+            corr_matrix: Pearson correlation matrix (N x N)
+
+        Returns:
+            Adjacency matrix (N x N)
+        """
+        N = corr_matrix.shape[0]
+        A = np.zeros((N, N))
+
+        # Apply threshold on absolute correlation
+        mask = np.abs(corr_matrix) >= self.correlation_threshold
+        A[mask] = self.correlation_threshold
+
+        # Zero out diagonal (no self-loops)
+        np.fill_diagonal(A, 0)
+
+        return A
+
+    def _normalize_adjacency(self, A, add_self_loops=True):
+        """
+        Normalize adjacency matrix using symmetric normalization.
+
+        Â = D̃^{-1/2} Ã D̃^{-1/2}
+
+        Args:
+            A: Adjacency matrix (N x N)
+            add_self_loops: Whether to add self-loops
+
+        Returns:
+            Normalized adjacency matrix
+        """
+        if add_self_loops:
+            A_tilde = A + np.eye(A.shape[0])
+        else:
+            A_tilde = A.copy()
+
+        # Compute degree
+        d = A_tilde.sum(axis=1)
+        d_inv_sqrt = np.power(d, -0.5, where=d > 0)
+        d_inv_sqrt[d == 0] = 0
+
+        D_inv_sqrt = np.diag(d_inv_sqrt)
+
+        # Symmetric normalization
+        A_norm = D_inv_sqrt @ A_tilde @ D_inv_sqrt
+
+        return A_norm
+
+    def _compute_rolling_adjacencies(self, data, data_map, sliding_window):
+        """
+        Compute per-sample Pearson correlation adjacency matrices.
+
+        For each sample window, compute correlation using the lookback period
+        of returns data, apply threshold to create adjacency, and normalize.
+
+        Args:
+            data: Original DataFrame with all data
+            data_map: Batched data containing dates for each window
+            sliding_window: Whether using sliding windows
+
+        Returns:
+            adjacencies: np.ndarray of shape (num_windows, num_tickers, num_tickers)
+        """
+        id_col = get_single_col_by_input_type(InputTypes.ID, self._column_definition)
+        time_col = get_single_col_by_input_type(InputTypes.TIME, self._column_definition)
+
+        # Get sorted tickers
+        tickers = sorted(data[id_col].unique())
+        num_tickers = len(tickers)
+        num_windows = data_map["inputs"].shape[0]
+
+        # Use FULL dataframe for lookback (not just current split)
+        # This ensures we have enough historical data for correlation lookback
+        data_copy = self._full_df.copy()
+        if not isinstance(data_copy.index, pd.DatetimeIndex):
+            data_copy = data_copy.reset_index()
+
+        # Get returns data for each ticker
+        returns_pivot = data_copy.pivot_table(
+            index=time_col,
+            columns=id_col,
+            values=self.returns_column,
+            aggfunc='first'
+        )
+        returns_pivot = returns_pivot[tickers]  # Ensure ticker order matches
+        returns_pivot = returns_pivot.sort_index()
+
+        # Get the dates for each window from the batched data
+        # date shape: (num_windows, num_tickers, time_steps, 1) or similar
+        dates = data_map["date"]
+        if dates.ndim == 4 and dates.shape[-1] == 1:
+            dates = np.squeeze(dates, axis=-1)
+
+        adjacencies = []
+
+        for window_idx in range(num_windows):
+            # Get the end date for this window (last time step of first ticker)
+            # We use the date from the first ticker (column 0) as reference
+            window_dates = dates[window_idx, 0, :]  # (time_steps,)
+            end_date = window_dates[-1]  # Last date in window
+
+            # Find the position of end_date in the returns index
+            try:
+                end_pos = returns_pivot.index.get_loc(end_date)
+            except KeyError:
+                # If exact date not found, use nearest
+                end_pos = returns_pivot.index.searchsorted(end_date)
+                end_pos = min(end_pos, len(returns_pivot) - 1)
+
+            # Compute start position based on lookback
+            start_pos = max(0, end_pos - self.correlation_lookback + 1)
+
+            # Get returns for this lookback period
+            lookback_returns = returns_pivot.iloc[start_pos:end_pos + 1]
+
+            # Handle case where we don't have enough data
+            if len(lookback_returns) < 2:
+                # Not enough data for correlation, use identity matrix
+                A_norm = np.eye(num_tickers)
+            else:
+                # Compute correlation matrix
+                corr_matrix = self._compute_correlation_matrix(lookback_returns)
+
+                # Build adjacency from correlation
+                A = self._build_adjacency_from_correlation(corr_matrix)
+
+                # Normalize
+                A_norm = self._normalize_adjacency(A, add_self_loops=True)
+
+            adjacencies.append(A_norm)
+
+        return np.stack(adjacencies, axis=0)
+
+    def make_rolling_graph_dataset(
+        self,
+        sliding_window=True,
+    ):
+        """
+        Return the datasets with rolling adjacency matrices.
+
+        The adjacencies are already computed during __init__ when _batch_data is called.
+
+        Args:
+            sliding_window: If True, return test_sliding; otherwise return test_fixed
+
+        Returns:
+            Dictionary containing train, valid, test data with adjacency matrices
+        """
+        test_data = self.test_sliding if sliding_window else self.test_fixed
+
+        return {
+            "train": self.train,
+            "valid": self.valid,
+            "test": test_data,
+        }
