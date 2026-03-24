@@ -18,26 +18,30 @@ from gml.data_prep import (
 from settings.default import STRADDLE, PEARSON, GRAPH_NORMALIZATION
 
 GRAPH_THRESHOLD = 0.6
+USE_THRESHOLD_WEIGHTS = True  # If True, edge weights = τ; if False, edge weights = 1 (binary)
 
 import numpy as np
 import pandas as pd
 from typing import List
 
-def compute_pearson_log_returns_adjacency(tickers: List[str], data_loader, threshold: float):
+def compute_pearson_log_returns_adjacency(tickers: List[str], data_loader, threshold: float,
+                                          use_threshold_weights: bool = False):
     """
     Given a list of tickers, a function to load their data, and a correlation threshold,
     returns:
       1. A DataFrame of log returns for each ticker,
       2. The correlation matrix (Pearson),
-      3. The adjacency matrix (binary) based on the given threshold (with no self loops).
-    
-    Additionally, it computes and displays the ratio of 1's (edges) to the total number of 
+      3. The adjacency matrix based on the given threshold (with no self loops).
+
+    Additionally, it computes and displays the ratio of edges to the total number of
     off-diagonal entries in the matrix.
-    
+
     :param tickers: List of ticker symbols.
     :param data_loader: Function that takes a ticker and returns a DataFrame containing
                         at least a 'price' column for that ticker.
     :param threshold: Correlation threshold for creating the adjacency matrix.
+    :param use_threshold_weights: If True, edge weights are τ (threshold value).
+                                  If False, edge weights are 1 (binary).
     :return: (log_returns_df, corr_matrix, adjacency_matrix)
     """
 
@@ -63,19 +67,26 @@ def compute_pearson_log_returns_adjacency(tickers: List[str], data_loader, thres
     # Compute Pearson correlation matrix
     corr_matrix = log_returns_df.corr(method="pearson")
 
-    # Create adjacency matrix: 1 if |corr| >= threshold, else 0
-    adjacency_matrix = (corr_matrix.abs() >= threshold).astype(int)
+    # Create adjacency matrix based on threshold
+    mask = corr_matrix.abs() >= threshold
+    if use_threshold_weights:
+        # Edge weight = τ (threshold value)
+        adjacency_matrix = mask.astype(float) * threshold
+    else:
+        # Edge weight = 1 (binary)
+        adjacency_matrix = mask.astype(int)
 
     # Remove self loops by setting the diagonal to 0
     np.fill_diagonal(adjacency_matrix.values, 0)
 
-    # Compute statistics: total number of 1's divided by the total number of off-diagonal entries.
+    # Compute statistics: number of edges divided by the total number of off-diagonal entries.
     n = adjacency_matrix.shape[0]
     total_possible_off_diagonal = n * (n - 1)
-    ones_count = adjacency_matrix.values.sum()
-    density = ones_count / total_possible_off_diagonal if total_possible_off_diagonal > 0 else 0
+    edges_count = (adjacency_matrix.values > 0).sum()
+    density = edges_count / total_possible_off_diagonal if total_possible_off_diagonal > 0 else 0
 
-    print(f"Graph density (excluding self loops): {ones_count}/{total_possible_off_diagonal} = {density:.4f}")
+    weight_type = f"τ={threshold}" if use_threshold_weights else "binary"
+    print(f"Graph density ({weight_type}): {edges_count}/{total_possible_off_diagonal} = {density:.4f}")
 
     return log_returns_df, corr_matrix, adjacency_matrix
 
@@ -96,6 +107,7 @@ def main(
             tickers=ALL_TICKERS,
             data_loader=pull_equities_sample_data,
             threshold=GRAPH_THRESHOLD,
+            use_threshold_weights=USE_THRESHOLD_WEIGHTS,
         )
     else:
         _, _, adjacency_matrix = compute_convex_optimization_adjaceny(

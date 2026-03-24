@@ -651,6 +651,7 @@ class RollingGraphModelFeatures(GraphModelFeatures):
         correlation_lookback=20,
         correlation_threshold=0.5,
         returns_column="daily_returns",
+        use_equity_returns=False,
         **kwargs
     ):
         """
@@ -660,14 +661,108 @@ class RollingGraphModelFeatures(GraphModelFeatures):
             correlation_lookback: Number of time steps to use for correlation (20, 40, 60)
             correlation_threshold: Threshold for Pearson correlation (tau)
             returns_column: Column name containing returns for correlation computation
+            use_equity_returns: If True, use equity log returns instead of straddle returns
+                               for correlation computation (matches lstm_gcn_static behavior)
             **kwargs: Additional arguments passed to parent class
         """
         self.correlation_lookback = correlation_lookback
         self.correlation_threshold = correlation_threshold
         self.returns_column = returns_column
+        self.use_equity_returns = use_equity_returns
         # Store the full dataframe for adjacency computation
         self._full_df = df.copy()
+
+        # Load equity returns if requested
+        self._equity_returns_pivot = None
+        if use_equity_returns:
+            self._equity_returns_pivot = self._load_equity_returns(df)
+
         super().__init__(df, total_time_steps, **kwargs)
+
+    def _load_equity_returns(self, df):
+        """
+        Load equity log returns for correlation computation.
+
+        First tries to load from cached CSV file. If not found, downloads
+        from yfinance and saves to cache.
+
+        Cache location: data/graph_structure/equity_returns/log_returns.csv
+        """
+        import os
+
+        cache_path = os.path.join("data", "graph_structure", "equity_returns", "log_returns.csv")
+
+        # Get tickers from the dataframe
+        tickers = sorted(df['ticker'].unique())
+
+        # Try to load from cache first
+        if os.path.exists(cache_path):
+            print(f"Loading equity returns from cache: {cache_path}")
+            log_returns_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            log_returns_df = log_returns_df.sort_index()
+
+            # Verify all tickers are present
+            missing = set(tickers) - set(log_returns_df.columns)
+            if missing:
+                print(f"Warning: Missing tickers in cache: {missing}")
+                print("Run 'python examples/create_equity_returns_cache.py' to regenerate cache.")
+
+            print(f"Equity returns shape: {log_returns_df.shape}")
+            print(f"Equity date range: {log_returns_df.index.min().date()} to {log_returns_df.index.max().date()}")
+            return log_returns_df
+
+        # Cache not found - download from yfinance
+        print(f"Cache not found at {cache_path}. Downloading from yfinance...")
+        print("Tip: Run 'python examples/create_equity_returns_cache.py' to precompute and cache.")
+
+        import yfinance as yf
+        import warnings
+        warnings.filterwarnings('ignore')
+
+        # Get date range from the dataframe
+        min_date = df['date'].min()
+        max_date = df['date'].max()
+
+        # Add buffer for lookback
+        start_date = (pd.to_datetime(min_date) - pd.Timedelta(days=365)).strftime('%Y-%m-%d')
+        end_date = (pd.to_datetime(max_date) + pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+
+        print(f"Loading equity returns for {len(tickers)} tickers...")
+        print(f"Date range: {start_date} to {end_date}")
+
+        # Map tickers that need different symbols for yfinance
+        ticker_map = {'BRKB': 'BRK-B'}
+
+        log_return_dict = {}
+        failed = []
+
+        for ticker in tickers:
+            yf_ticker = ticker_map.get(ticker, ticker)
+            try:
+                stock = yf.Ticker(yf_ticker)
+                hist = stock.history(start=start_date, end=end_date)
+                if len(hist) > 0:
+                    log_returns = np.log(hist['Close']).diff()
+                    log_return_dict[ticker] = log_returns
+                else:
+                    failed.append(ticker)
+            except Exception as e:
+                failed.append(ticker)
+
+        print(f"Successfully loaded: {len(log_return_dict)} tickers")
+        if failed:
+            print(f"Failed to load: {failed}")
+
+        # Create DataFrame
+        log_returns_df = pd.DataFrame(log_return_dict)
+        log_returns_df.index = pd.to_datetime(log_returns_df.index).tz_localize(None)
+        log_returns_df = log_returns_df.dropna(how='all')
+        log_returns_df = log_returns_df.sort_index()
+
+        print(f"Equity returns shape: {log_returns_df.shape}")
+        print(f"Equity date range: {log_returns_df.index.min().date()} to {log_returns_df.index.max().date()}")
+
+        return log_returns_df
 
     def _batch_data(self, data, sliding_window):
         """
@@ -780,14 +875,20 @@ class RollingGraphModelFeatures(GraphModelFeatures):
             data_copy = data_copy.reset_index()
 
         # Get returns data for each ticker
-        returns_pivot = data_copy.pivot_table(
-            index=time_col,
-            columns=id_col,
-            values=self.returns_column,
-            aggfunc='first'
-        )
-        returns_pivot = returns_pivot[tickers]  # Ensure ticker order matches
-        returns_pivot = returns_pivot.sort_index()
+        if self.use_equity_returns and self._equity_returns_pivot is not None:
+            # Use preloaded equity log returns
+            returns_pivot = self._equity_returns_pivot[tickers].copy()
+            print(f"Using EQUITY log returns for correlation (shape: {returns_pivot.shape})")
+        else:
+            # Use straddle returns from the features dataframe
+            returns_pivot = data_copy.pivot_table(
+                index=time_col,
+                columns=id_col,
+                values=self.returns_column,
+                aggfunc='first'
+            )
+            returns_pivot = returns_pivot[tickers]  # Ensure ticker order matches
+            returns_pivot = returns_pivot.sort_index()
 
         # Get the dates for each window from the batched data
         # date shape: (num_windows, num_tickers, time_steps, 1) or similar

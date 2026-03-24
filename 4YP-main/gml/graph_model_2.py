@@ -1,3 +1,7 @@
+print("=" * 70)
+print("LOADING graph_model_2.py - VERSION WITH run_trial DEBUG PRINTS")
+print("=" * 70)
+
 import tensorflow as tf
 import numpy as np
 import pandas as pd
@@ -184,6 +188,11 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
         )
 
     def run_trial(self, trial, *args, **kwargs):
+        print(f"\n{'='*60}")
+        print(f"DEBUG: GraphTunerValidationLoss.run_trial() CALLED")
+        print(f"DEBUG: trial.trial_id = {trial.trial_id}")
+        print(f"{'='*60}\n")
+
         kwargs["batch_size"] = trial.hyperparameters.Choice(
             "batch_size", values=self.hp_minibatch_size
         )
@@ -194,8 +203,11 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
                 cb.restore_best_weights = True
 
         # Build and train model, then store in memory
+        print("DEBUG: Building model...")
         model = self.hypermodel.build(trial.hyperparameters)
+        print("DEBUG: Starting model.fit()...")
         history = model.fit(*args, **kwargs)
+        print("DEBUG: model.fit() completed!")
         self._trained_models[trial.trial_id] = model
         return history
 
@@ -207,8 +219,14 @@ class GraphTunerValidationLoss(kt.RandomSearch): # TODO changed
             if trial.trial_id in self._trained_models:
                 models.append(self._trained_models[trial.trial_id])
             else:
-                # Fallback to parent method if not in memory
-                models.append(super().load_model(trial))
+                # Try loading from disk, rebuild if that fails
+                try:
+                    models.append(super().load_model(trial))
+                except (FileNotFoundError, OSError):
+                    # Checkpoint missing - rebuild model with best HP (untrained)
+                    print(f"Warning: Could not load weights for {trial.trial_id}, rebuilding model")
+                    model = self.hypermodel.build(trial.hyperparameters)
+                    models.append(model)
         return models
 
 
@@ -240,27 +258,33 @@ class GraphTunerDiversifiedSharpe(kt.RandomSearch):
         )
 
     def run_trial(self, trial, *args, **kwargs):
+        print(f"\n{'='*60}")
+        print(f"DEBUG: GraphTunerDiversifiedSharpe.run_trial() CALLED")
+        print(f"DEBUG: trial.trial_id = {trial.trial_id}")
+        print(f"DEBUG: executions_per_trial = {self.executions_per_trial}")
+        print(f"{'='*60}\n")
+
         kwargs["batch_size"] = trial.hyperparameters.Choice(
             "batch_size", values=self.hp_minibatch_size
         )
 
         original_callbacks = kwargs.pop("callbacks", [])
 
-        # Shorten trial ID when creating checkpoint path
-        short_trial_id = trial.trial_id  # Shorten trial ID TODO
-
-        for callback in original_callbacks:
-            if isinstance(callback, GraphSharpeValidationLoss):
-                callback.set_weights_save_loc(
-                    self._get_checkpoint_fname(short_trial_id, self._reported_step)
-                )
-
         # Run the training process multiple times.
         metrics = collections.defaultdict(list)
         best_model = None
         for execution in range(self.executions_per_trial):
+            print(f"DEBUG: Starting execution {execution + 1}/{self.executions_per_trial}")
             copied_fit_kwargs = copy.copy(kwargs)
             callbacks = self._deepcopy_callbacks(original_callbacks)
+
+            # Set checkpoint path AFTER deep copy to ensure it's preserved
+            for callback in callbacks:
+                if isinstance(callback, GraphSharpeValidationLoss):
+                    callback.set_weights_save_loc(
+                        self._get_checkpoint_fname(trial.trial_id, self._reported_step)
+                    )
+
             self._configure_tensorboard_dir(callbacks, trial, execution)
             callbacks.append(kt.engine.tuner_utils.TunerCallback(self, trial))
             copied_fit_kwargs["callbacks"] = callbacks
@@ -298,8 +322,14 @@ class GraphTunerDiversifiedSharpe(kt.RandomSearch):
             if trial.trial_id in self._trained_models:
                 models.append(self._trained_models[trial.trial_id])
             else:
-                # Fallback to parent method if not in memory
-                models.append(super().load_model(trial))
+                # Try loading from disk, rebuild if that fails
+                try:
+                    models.append(super().load_model(trial))
+                except (FileNotFoundError, OSError):
+                    # Checkpoint missing - rebuild model with best HP (untrained)
+                    print(f"Warning: Could not load weights for {trial.trial_id}, rebuilding model")
+                    model = self.hypermodel.build(trial.hyperparameters)
+                    models.append(model)
         return models
 
 
@@ -335,6 +365,8 @@ class GraphDeepMomentumNetwork(ABC):
             return self.model_builder(hp)
 
         if self.evaluate_diversified_val_sharpe:
+            print(f"DEBUG: Creating GraphTunerDiversifiedSharpe with overwrite=True")
+            print(f"DEBUG: directory={hp_directory}, project_name={project_name}")
             self.tuner = GraphTunerDiversifiedSharpe(
                 model_builder,
                 # objective="val_loss",
@@ -343,8 +375,12 @@ class GraphDeepMomentumNetwork(ABC):
                 max_trials=self.random_search_iterations,
                 directory=hp_directory,
                 project_name=project_name,
+                overwrite=True,  # Clear corrupted oracle state
             )
+            print(f"DEBUG: Tuner created. executions_per_trial={self.tuner.executions_per_trial}")
         else:
+            print(f"DEBUG: Creating GraphTunerValidationLoss with overwrite=True")
+            print(f"DEBUG: directory={hp_directory}, project_name={project_name}")
             self.tuner = GraphTunerValidationLoss(
                 model_builder,
                 objective="val_loss",
@@ -352,7 +388,9 @@ class GraphDeepMomentumNetwork(ABC):
                 max_trials=self.random_search_iterations,
                 directory=hp_directory,
                 project_name=project_name,
+                overwrite=True,  # Clear corrupted oracle state
             )
+            print(f"DEBUG: Tuner created.")
 
     @abstractmethod
     def model_builder(self, hp):
@@ -417,6 +455,8 @@ class GraphDeepMomentumNetwork(ABC):
             # print("x:", data)
             # print("\n")
             # print("y:", labels)
+            print(f"\nDEBUG: Calling tuner.search() with epochs={self.num_epochs}")
+            print(f"DEBUG: data.shape={data.shape}, labels.shape={labels.shape}")
             self.tuner.search(
                 x=data,
                 y=labels,
@@ -425,6 +465,7 @@ class GraphDeepMomentumNetwork(ABC):
                 callbacks=callbacks,
                 shuffle=True,
             )
+            print("DEBUG: tuner.search() returned")
         else:
             callbacks = [
                 tf.keras.callbacks.EarlyStopping(
