@@ -62,7 +62,7 @@ def compute_equity_pearson_adjacency(
     # Build adjacency from correlation using threshold
     A = np.zeros((num_tickers, num_tickers))
     mask = np.abs(corr_matrix) >= threshold
-    A[mask] = threshold  # Use threshold value (per spec: A_{i,j} = τ)
+    A[mask] = np.abs(corr_matrix[mask])
     np.fill_diagonal(A, 0)  # No self-loops initially
 
     # Count edges
@@ -137,7 +137,7 @@ def compute_straddle_pearson_adjacency(
     # Build adjacency from correlation using threshold
     A = np.zeros((num_tickers, num_tickers))
     mask = np.abs(corr_matrix) >= threshold
-    A[mask] = threshold  # Use threshold value (like rolling implementation)
+    A[mask] = np.abs(corr_matrix[mask])
     np.fill_diagonal(A, 0)  # No self-loops initially
 
     # Count edges

@@ -26,21 +26,21 @@ class GraphSharpeLoss(tf.keras.losses.Loss):
         self.output_size = output_size
         super().__init__()
 
-    def call(self, y_true, weights):
+    def call(self, y_true, y_pred):
         """
         Compute negative Sharpe ratio as loss.
 
         Args:
             y_true: True returns, shape (batch_size, N, time_steps, 1)
-            weights: Predicted positions, shape (batch_size, N, time_steps, 1)
+            y_pred: Predicted positions, shape (batch_size, N, time_steps, 1)
 
         Returns:
             Negative annualized Sharpe ratio
         """
         y_true = tf.reshape(y_true, [-1])
-        weights = tf.reshape(weights, [-1])
+        y_pred = tf.reshape(y_pred, [-1])
 
-        captured_returns = weights * y_true
+        captured_returns = y_pred * y_true
         mean_returns = tf.reduce_mean(captured_returns)
 
         return -(
@@ -196,7 +196,7 @@ def build_lstm_gcn_model(
     model = keras.Model(inputs=input_layer, outputs=output)
 
     adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
-    sharpe_loss = GraphSharpeLoss(output_size=1).call
+    sharpe_loss = GraphSharpeLoss(output_size=1)
 
     model.compile(
         loss=sharpe_loss,

@@ -808,7 +808,7 @@ class RollingGraphModelFeatures(GraphModelFeatures):
 
         # Apply threshold on absolute correlation
         mask = np.abs(corr_matrix) >= self.correlation_threshold
-        A[mask] = self.correlation_threshold
+        A[mask] = np.abs(corr_matrix[mask])
 
         # Zero out diagonal (no self-loops)
         np.fill_diagonal(A, 0)
@@ -902,7 +902,7 @@ class RollingGraphModelFeatures(GraphModelFeatures):
             # Use the day BEFORE the window starts to avoid look-ahead bias
             # This ensures adjacency only contains information available before the window
             window_dates = dates[window_idx, 0, :]  # (time_steps,)
-            window_start_date = window_dates[0]  # First date in window
+            window_start_date = pd.Timestamp(window_dates[0])  # First date in window
 
             # Find the position of window_start_date in the returns index
             try:
