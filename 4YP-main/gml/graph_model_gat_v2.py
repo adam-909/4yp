@@ -1,9 +1,13 @@
 """
 Clean LSTM-GAT models for end-to-end and graph-guided training.
 
-Two model builders:
+Per-timestep model builders (GAT runs independently per timestep):
     build_lstm_gat_model: End-to-end full attention (no graph needed)
     build_lstm_gat_sparse_model: Static graph masks attention
+
+Trajectory model builders (LSTM outputs concatenated, GAT runs once, predict day 20 only):
+    build_lstm_gat_trajectory_model: End-to-end full attention
+    build_lstm_gat_trajectory_sparse_model: Static graph masks attention
 
 Layer:
     GraphAttentionLayer: Supports both full and sparse attention modes
@@ -236,6 +240,10 @@ def build_lstm_gat_model(
     return model
 
 
+# ---------------------------------------------------------------------------
+# Per-timestep sparse model
+# ---------------------------------------------------------------------------
+
 def build_lstm_gat_sparse_model(
     num_tickers: int,
     time_steps: int,
@@ -329,6 +337,167 @@ def build_lstm_gat_sparse_model(
     )(x)
 
     output = layers.Permute((2, 1, 3))(output)
+
+    model = keras.Model(inputs=input_layer, outputs=output)
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Trajectory model builders (concat LSTM outputs, GAT once, predict day 20)
+# ---------------------------------------------------------------------------
+
+def _build_lstm_backbone(input_layer, num_tickers, hidden_layer_size, dropout_rate):
+    """Shared LSTM backbone. Returns (batch, num_tickers, time_steps, hidden_size)."""
+    shared_lstm = layers.LSTM(
+        hidden_layer_size,
+        return_sequences=True,
+        dropout=dropout_rate,
+        activation="tanh",
+        recurrent_activation="sigmoid",
+        name="shared_lstm",
+    )
+
+    lstm_outputs = []
+    for i in range(num_tickers):
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(input_layer)
+        lstm_outputs.append(shared_lstm(ticker_slice))
+
+    # Stack: (batch, num_tickers, time_steps, hidden_size)
+    stacked = layers.Lambda(lambda t: tf.stack(t, axis=1))(lstm_outputs)
+    return stacked
+
+
+def build_lstm_gat_trajectory_model(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    hidden_layer_size: int = 10,
+    gat_units: int = 8,
+    attn_heads: int = 2,
+    dropout_rate: float = 0.5,
+    learning_rate: float = 0.0005,
+    max_gradient_norm: float = 0.01,
+    num_gat_layers: int = 1,
+) -> keras.Model:
+    """
+    Build trajectory-based end-to-end LSTM-GAT model.
+
+    Instead of running GAT independently per timestep, this model:
+    1. Runs shared LSTM across all timesteps per stock
+    2. Flattens all LSTM hidden states into one vector per stock
+    3. Runs GAT once on the 88 trajectory vectors
+    4. Outputs one position per stock (day 20 only)
+
+    Output shape: (batch, num_tickers, 1)
+    """
+    input_layer = keras.Input(shape=(num_tickers, time_steps, input_size))
+
+    stacked_lstm = _build_lstm_backbone(
+        input_layer, num_tickers, hidden_layer_size, dropout_rate
+    )
+
+    # Flatten all timesteps per stock: (batch, 88, time_steps * hidden_size)
+    concat_dim = time_steps * hidden_layer_size
+    trajectory = layers.Reshape((num_tickers, concat_dim))(stacked_lstm)
+
+    # GAT on 3D input: (batch, 88, concat_dim)
+    x = trajectory
+    for k in range(num_gat_layers):
+        is_last = (k == num_gat_layers - 1)
+        x = GraphAttentionLayer(
+            units=gat_units,
+            attn_heads=attn_heads,
+            adjacency=None,
+            concat_heads=not is_last,
+            dropout_rate=dropout_rate,
+            name=f"traj_gat_{k}",
+        )(x)
+        x = layers.LayerNormalization()(x)
+        x = layers.ReLU()(x)
+
+    # Residual: project trajectory to match GAT output dim
+    residual = layers.Dense(
+        gat_units, activation="linear", name="residual_proj"
+    )(trajectory)
+    x = layers.Add()([x, residual])
+
+    # Output: one position per stock
+    output = layers.Dense(
+        1,
+        activation=tf.nn.tanh,
+        kernel_constraint=keras.constraints.max_norm(3),
+        name="position_output",
+    )(x)
+
+    model = keras.Model(inputs=input_layer, outputs=output)
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
+
+    return model
+
+
+def build_lstm_gat_trajectory_sparse_model(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    adjacency: np.ndarray,
+    hidden_layer_size: int = 10,
+    gat_units: int = 8,
+    attn_heads: int = 2,
+    dropout_rate: float = 0.5,
+    learning_rate: float = 0.0005,
+    max_gradient_norm: float = 0.01,
+    num_gat_layers: int = 1,
+) -> keras.Model:
+    """
+    Build trajectory-based graph-guided LSTM-GAT model.
+
+    Same as build_lstm_gat_trajectory_model but attention is masked
+    by a static adjacency matrix.
+
+    Output shape: (batch, num_tickers, 1)
+    """
+    input_layer = keras.Input(shape=(num_tickers, time_steps, input_size))
+
+    stacked_lstm = _build_lstm_backbone(
+        input_layer, num_tickers, hidden_layer_size, dropout_rate
+    )
+
+    # Flatten all timesteps per stock: (batch, 88, time_steps * hidden_size)
+    concat_dim = time_steps * hidden_layer_size
+    trajectory = layers.Reshape((num_tickers, concat_dim))(stacked_lstm)
+
+    # Sparse GAT on 3D input: (batch, 88, concat_dim)
+    x = trajectory
+    for k in range(num_gat_layers):
+        is_last = (k == num_gat_layers - 1)
+        x = GraphAttentionLayer(
+            units=gat_units,
+            attn_heads=attn_heads,
+            adjacency=adjacency,
+            concat_heads=not is_last,
+            dropout_rate=dropout_rate,
+            name=f"traj_sparse_gat_{k}",
+        )(x)
+        x = layers.LayerNormalization()(x)
+        x = layers.ReLU()(x)
+
+    # Residual
+    residual = layers.Dense(
+        gat_units, activation="linear", name="residual_proj"
+    )(trajectory)
+    x = layers.Add()([x, residual])
+
+    # Output: one position per stock
+    output = layers.Dense(
+        1,
+        activation=tf.nn.tanh,
+        kernel_constraint=keras.constraints.max_norm(3),
+        name="position_output",
+    )(x)
 
     model = keras.Model(inputs=input_layer, outputs=output)
     adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
