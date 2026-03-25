@@ -9,6 +9,9 @@ Trajectory model builders (LSTM outputs concatenated, GAT runs once, predict day
     build_lstm_gat_trajectory_model: End-to-end full attention
     build_lstm_gat_trajectory_sparse_model: Static graph masks attention
 
+Utility:
+    extract_attention_weights: Extract per-sample attention weights from trained model
+
 Layer:
     GraphAttentionLayer: Supports both full and sparse attention modes
 """
@@ -133,6 +136,98 @@ class GraphAttentionLayer(layers.Layer):
             "dropout_rate": self.dropout_rate,
         })
         return config
+
+
+# ---------------------------------------------------------------------------
+# Attention extraction
+# ---------------------------------------------------------------------------
+
+def extract_attention_weights(model, inputs, gat_layer_name="sparse_gat_0"):
+    """
+    Extract per-sample attention weights from a trained GAT model.
+
+    Replicates the attention computation using the trained layer's weights
+    applied to the LSTM hidden states. Does not modify the model.
+
+    Args:
+        model: Trained Keras model containing GraphAttentionLayer(s)
+        inputs: Test inputs, shape (num_samples, num_tickers, time_steps, input_size)
+        gat_layer_name: Name of the GAT layer to extract from
+
+    Returns:
+        attention_weights: np.ndarray of shape (num_samples, num_heads, num_nodes, num_nodes)
+            Attention weights averaged across timesteps (for per-timestep models)
+            or for the single GAT pass (for trajectory models).
+    """
+    gat_layer = model.get_layer(gat_layer_name)
+    W = gat_layer.W.numpy()          # (num_heads, input_dim, units)
+    a_src = gat_layer.a_src.numpy()  # (num_heads, units, 1)
+    a_dst = gat_layer.a_dst.numpy()  # (num_heads, units, 1)
+    num_heads = W.shape[0]
+
+    # Check if layer has an attention mask (sparse GAT)
+    has_mask = gat_layer.attention_mask is not None
+    if has_mask:
+        mask = gat_layer.attention_mask.numpy()  # (num_nodes, num_nodes)
+
+    # Build sub-model to get the GAT layer's input (LSTM stacked output)
+    # Find the layer that feeds into the GAT layer
+    gat_layer_input = gat_layer.input
+    sub_model = keras.Model(inputs=model.input, outputs=gat_layer_input)
+
+    # Get LSTM hidden states for all test samples
+    lstm_output = sub_model.predict(inputs, verbose=0)
+    # Shape: (num_samples, time_steps, num_nodes, hidden) for per-timestep
+    #    or: (num_samples, num_nodes, concat_dim) for trajectory
+
+    all_attention = []
+
+    for sample_idx in range(lstm_output.shape[0]):
+        sample = lstm_output[sample_idx]  # (time_steps, nodes, hidden) or (nodes, features)
+
+        if sample.ndim == 3:
+            # Per-timestep model: average attention across timesteps
+            # sample: (time_steps, nodes, hidden)
+            head_attns = []
+            for head in range(num_heads):
+                h = sample @ W[head]  # (time_steps, nodes, units)
+                src = h @ a_src[head]  # (time_steps, nodes, 1)
+                dst = h @ a_dst[head]  # (time_steps, nodes, 1)
+                scores = src + dst.transpose(0, 2, 1)  # (time_steps, nodes, nodes)
+                scores = np.where(scores > 0, scores, 0.2 * scores)  # LeakyReLU
+
+                if has_mask:
+                    scores = np.where(mask[None] > 0, scores, -1e9)
+
+                # Softmax over last axis
+                exp_scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
+                attn = exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-9)
+
+                # Average across timesteps
+                head_attns.append(attn.mean(axis=0))  # (nodes, nodes)
+
+            all_attention.append(np.stack(head_attns, axis=0))  # (heads, nodes, nodes)
+
+        else:
+            # Trajectory model: single pass, sample is (nodes, features)
+            head_attns = []
+            for head in range(num_heads):
+                h = sample @ W[head]  # (nodes, units)
+                src = h @ a_src[head]  # (nodes, 1)
+                dst = h @ a_dst[head]  # (nodes, 1)
+                scores = src + dst.T  # (nodes, nodes)
+                scores = np.where(scores > 0, scores, 0.2 * scores)
+
+                if has_mask:
+                    scores = np.where(mask > 0, scores, -1e9)
+
+                exp_scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
+                attn = exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-9)
+                head_attns.append(attn)
+
+            all_attention.append(np.stack(head_attns, axis=0))
+
+    return np.stack(all_attention, axis=0)  # (num_samples, num_heads, nodes, nodes)
 
 
 # ---------------------------------------------------------------------------
