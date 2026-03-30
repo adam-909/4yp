@@ -570,3 +570,180 @@ def build_lstm_gat_e2e_v2_prev_window(
     model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4a: Per-timestep GATv2, NO residual connection
+# ---------------------------------------------------------------------------
+
+def build_lstm_gat_e2e_v3(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    hidden_layer_size: int = 32,
+    gat_units: int = 16,
+    attn_heads: int = 4,
+    lstm_dropout: float = 0.3,
+    attn_dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    max_gradient_norm: float = 1.0,
+    num_gat_layers: int = 1,
+) -> keras.Model:
+    """
+    Experiment 4a: Per-timestep LSTM-GATv2 WITHOUT residual connection.
+
+    Identical to build_lstm_gat_e2e_v2 except the residual path is removed,
+    forcing all information to flow through the GAT layer. This is motivated
+    by the diagnostic finding that the residual connection allows the model
+    to bypass attention entirely (attention entropy = 4.44/4.48 = uniform).
+
+    Without the residual, the model must learn meaningful attention weights
+    to produce good positions, since the only path from LSTM to output goes
+    through the GATv2 layer.
+    """
+    input_layer = keras.Input(shape=(num_tickers, time_steps, input_size))
+
+    # Shared LSTM
+    shared_lstm = layers.LSTM(
+        hidden_layer_size,
+        return_sequences=True,
+        dropout=lstm_dropout,
+        activation="tanh",
+        recurrent_activation="sigmoid",
+        name="shared_lstm",
+    )
+
+    lstm_outputs = []
+    for i in range(num_tickers):
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(input_layer)
+        lstm_outputs.append(shared_lstm(ticker_slice))
+
+    # Stack: (batch, time_steps, num_tickers, hidden_size)
+    stacked_lstm = layers.Lambda(lambda t: tf.stack(t, axis=2))(lstm_outputs)
+
+    # GATv2 layers (no residual, no LayerNorm)
+    x = stacked_lstm
+    for k in range(num_gat_layers):
+        is_last = (k == num_gat_layers - 1)
+        x = GraphAttentionLayerV2(
+            units=gat_units,
+            attn_heads=attn_heads,
+            attn_dropout=attn_dropout,
+            concat_heads=not is_last,
+            name=f"gat_v2_{k}",
+        )(x)
+        x = layers.ReLU()(x)
+
+    # NO residual — output directly from GAT
+
+    # Output: position in [-1, 1]
+    output = layers.TimeDistributed(
+        layers.TimeDistributed(
+            layers.Dense(
+                1,
+                activation=tf.nn.tanh,
+                kernel_constraint=keras.constraints.max_norm(3),
+            )
+        )
+    )(x)
+
+    # Permute to (batch, num_tickers, time_steps, 1)
+    output = layers.Permute((2, 1, 3))(output)
+
+    model = keras.Model(inputs=input_layer, outputs=output)
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4b: Previous-window GATv2, NO residual connection
+# ---------------------------------------------------------------------------
+
+def build_lstm_gat_e2e_v3_prev_window(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    hidden_layer_size: int = 32,
+    gat_units: int = 16,
+    attn_heads: int = 4,
+    lstm_dropout: float = 0.3,
+    attn_dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    max_gradient_norm: float = 1.0,
+    prev_feature_dim: int = None,
+) -> keras.Model:
+    """
+    Experiment 4b: LSTM-GATv2 with previous-window attention, NO residual.
+
+    Identical to build_lstm_gat_e2e_v2_prev_window except the residual path
+    is removed. All information must flow through the GATv2 attention layer.
+
+    Architecture:
+        1. Previous window raw features → GATv2 attention weights
+        2. Current window → Shared LSTM → per-timestep hidden states
+        3. Message passing at each timestep using pre-computed attention
+        4. Dense → positions in [-1, 1]  (NO residual skip)
+    """
+    if prev_feature_dim is None:
+        prev_feature_dim = time_steps * input_size
+
+    # --- Inputs ---
+    prev_input = keras.Input(
+        shape=(num_tickers, prev_feature_dim), name="prev_features"
+    )
+    curr_input = keras.Input(
+        shape=(num_tickers, time_steps, input_size), name="curr_features"
+    )
+
+    # --- Current window through shared LSTM ---
+    shared_lstm = layers.LSTM(
+        hidden_layer_size,
+        return_sequences=True,
+        dropout=lstm_dropout,
+        activation="tanh",
+        recurrent_activation="sigmoid",
+        name="shared_lstm",
+    )
+
+    lstm_outputs = []
+    for i in range(num_tickers):
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(curr_input)
+        lstm_outputs.append(shared_lstm(ticker_slice))
+
+    # (batch, time_steps, num_tickers, hidden_size)
+    stacked_lstm = layers.Lambda(lambda t: tf.stack(t, axis=2))(lstm_outputs)
+
+    # --- Attention from previous window, message passing on current ---
+    x = PrevWindowAttentionLayer(
+        units=gat_units,
+        attn_heads=attn_heads,
+        attn_dropout=attn_dropout,
+        msg_units=gat_units,
+        name="prev_window_gat",
+    )([prev_input, stacked_lstm])
+
+    x = layers.ReLU()(x)
+
+    # NO residual — output directly from GAT
+
+    # --- Output: position in [-1, 1] ---
+    output = layers.TimeDistributed(
+        layers.TimeDistributed(
+            layers.Dense(
+                1,
+                activation=tf.nn.tanh,
+                kernel_constraint=keras.constraints.max_norm(3),
+            )
+        )
+    )(x)
+
+    # Permute to (batch, num_tickers, time_steps, 1)
+    output = layers.Permute((2, 1, 3))(output)
+
+    model = keras.Model(inputs=[prev_input, curr_input], outputs=output)
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
+
+    return model
