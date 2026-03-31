@@ -747,3 +747,184 @@ def build_lstm_gat_e2e_v3_prev_window(
     model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4c: GATv2 constrained by rolling Pearson adjacency
+# ---------------------------------------------------------------------------
+
+class DynamicMaskedGATv2Layer(layers.Layer):
+    """
+    GATv2 layer that receives a per-sample adjacency mask.
+
+    Pearson correlation determines WHICH edges exist (structure).
+    GATv2 learns the WEIGHT of each edge (from LSTM hidden states).
+
+    For 4D input (batch, time, nodes, features), the same per-sample
+    adjacency mask is applied at every timestep.
+    """
+
+    def __init__(self, units, attn_heads=4, attn_dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.attn_heads = attn_heads
+        self.attn_dropout = attn_dropout
+
+    def build(self, input_shape):
+        features_shape = input_shape[0]
+        input_dim = features_shape[-1]
+
+        self.W_src = self.add_weight(
+            shape=(self.attn_heads, input_dim, self.units),
+            initializer="glorot_uniform", trainable=True, name="W_src",
+        )
+        self.W_dst = self.add_weight(
+            shape=(self.attn_heads, input_dim, self.units),
+            initializer="glorot_uniform", trainable=True, name="W_dst",
+        )
+        self.a = self.add_weight(
+            shape=(self.attn_heads, self.units, 1),
+            initializer="glorot_uniform", trainable=True, name="a",
+        )
+        self.dropout_layer = layers.Dropout(self.attn_dropout)
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        features, adjacency = inputs
+        # features: (batch, time, nodes, hidden) or (batch, nodes, hidden)
+        # adjacency: (batch, nodes, nodes)
+
+        if len(features.shape) == 4:
+            batch_size = tf.shape(features)[0]
+            time_steps = tf.shape(features)[1]
+            num_nodes = tf.shape(features)[2]
+
+            feat_3d = tf.reshape(
+                features, [-1, num_nodes, features.shape[-1]]
+            )
+            adj_tiled = tf.repeat(adjacency, repeats=time_steps, axis=0)
+
+            output = self._masked_attention(feat_3d, adj_tiled, training)
+            output = tf.reshape(
+                output, [batch_size, time_steps, num_nodes, self.units]
+            )
+        else:
+            output = self._masked_attention(features, adjacency, training)
+
+        return output
+
+    def _masked_attention(self, features, adjacency, training):
+        head_outputs = []
+
+        self_loops = tf.eye(
+            tf.shape(adjacency)[1], batch_shape=[tf.shape(adjacency)[0]]
+        )
+        mask = tf.cast((adjacency + self_loops) > 0, tf.float32)
+
+        for head in range(self.attn_heads):
+            h_src = tf.matmul(features, self.W_src[head])
+            h_dst = tf.matmul(features, self.W_dst[head])
+
+            pairwise = (
+                tf.expand_dims(h_src, 2) + tf.expand_dims(h_dst, 1)
+            )
+            pairwise = tf.nn.leaky_relu(pairwise, alpha=0.2)
+
+            scores = tf.squeeze(
+                tf.matmul(pairwise, self.a[head]), axis=-1
+            )
+
+            # Mask non-edges to -inf before softmax
+            scores = tf.where(mask > 0, scores, tf.ones_like(scores) * -1e9)
+
+            attn_weights = tf.nn.softmax(scores, axis=-1)
+            attn_weights = self.dropout_layer(attn_weights, training=training)
+
+            h_prime = tf.matmul(attn_weights, h_src)
+            head_outputs.append(h_prime)
+
+        return tf.reduce_mean(tf.stack(head_outputs, axis=-1), axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+            "attn_heads": self.attn_heads,
+            "attn_dropout": self.attn_dropout,
+        })
+        return config
+
+
+def build_lstm_gat_rolling(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    hidden_layer_size: int = 32,
+    gat_units: int = 16,
+    attn_heads: int = 4,
+    lstm_dropout: float = 0.3,
+    attn_dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    max_gradient_norm: float = 1.0,
+) -> keras.Model:
+    """
+    Experiment 4c: LSTM-GATv2 constrained by rolling Pearson adjacency.
+
+    Pearson determines WHICH edges exist. GATv2 learns the WEIGHTS.
+    Like rolling GCN but with learned, asymmetric, data-dependent edge weights.
+    No residual connection.
+
+    Returns:
+        Compiled Keras model with two inputs:
+            features: (batch, num_tickers, time_steps, input_size)
+            adjacency: (batch, num_tickers, num_tickers)
+    """
+    feature_input = keras.Input(
+        shape=(num_tickers, time_steps, input_size), name="features"
+    )
+    adjacency_input = keras.Input(
+        shape=(num_tickers, num_tickers), name="adjacency"
+    )
+
+    shared_lstm = layers.LSTM(
+        hidden_layer_size,
+        return_sequences=True,
+        dropout=lstm_dropout,
+        activation="tanh",
+        recurrent_activation="sigmoid",
+        name="shared_lstm",
+    )
+
+    lstm_outputs = []
+    for i in range(num_tickers):
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(feature_input)
+        lstm_outputs.append(shared_lstm(ticker_slice))
+
+    stacked_lstm = layers.Lambda(lambda t: tf.stack(t, axis=2))(lstm_outputs)
+
+    x = DynamicMaskedGATv2Layer(
+        units=gat_units,
+        attn_heads=attn_heads,
+        attn_dropout=attn_dropout,
+        name="dynamic_masked_gat",
+    )([stacked_lstm, adjacency_input])
+
+    x = layers.ReLU()(x)
+
+    output = layers.TimeDistributed(
+        layers.TimeDistributed(
+            layers.Dense(
+                1,
+                activation=tf.nn.tanh,
+                kernel_constraint=keras.constraints.max_norm(3),
+            )
+        )
+    )(x)
+
+    output = layers.Permute((2, 1, 3))(output)
+
+    model = keras.Model(inputs=[feature_input, adjacency_input], outputs=output)
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
+
+    return model
