@@ -889,13 +889,17 @@ def build_lstm_gat_rolling(
     learning_rate: float = 0.001,
     max_gradient_norm: float = 1.0,
     scale_scores: bool = False,
+    use_residual: bool = False,
 ) -> keras.Model:
     """
     Experiment 4c: LSTM-GATv2 constrained by rolling Pearson adjacency.
 
     Pearson determines WHICH edges exist. GATv2 learns the WEIGHTS.
     Like rolling GCN but with learned, asymmetric, data-dependent edge weights.
-    No residual connection.
+
+    Args:
+        use_residual: If True, add a residual connection from LSTM to output
+            (skip connection bypassing GAT). Default False.
 
     Returns:
         Compiled Keras model with two inputs:
@@ -934,6 +938,15 @@ def build_lstm_gat_rolling(
     )([stacked_lstm, adjacency_input])
 
     x = layers.ReLU()(x)
+
+    # Optional residual connection
+    if use_residual:
+        residual = layers.TimeDistributed(
+            layers.TimeDistributed(
+                layers.Dense(gat_units, activation="linear")
+            )
+        )(stacked_lstm)
+        x = layers.Add()([x, residual])
 
     output = layers.TimeDistributed(
         layers.TimeDistributed(
