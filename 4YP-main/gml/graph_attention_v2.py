@@ -51,12 +51,13 @@ class GraphAttentionLayerV2(layers.Layer):
     """
 
     def __init__(self, units, attn_heads=4, attn_dropout=0.1,
-                 concat_heads=True, **kwargs):
+                 concat_heads=True, scale_scores=False, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.attn_heads = attn_heads
         self.attn_dropout = attn_dropout
         self.concat_heads = concat_heads
+        self.scale_scores = scale_scores
 
     def build(self, input_shape):
         input_dim = input_shape[-1]
@@ -125,6 +126,10 @@ class GraphAttentionLayerV2(layers.Layer):
                 tf.matmul(pairwise, self.a[head]), axis=-1
             )  # (batch, nodes, nodes)
 
+            # Optional sqrt scaling (normalizes score magnitude across dims)
+            if self.scale_scores:
+                attn_scores = attn_scores / tf.sqrt(tf.cast(self.units, tf.float32))
+
             # Softmax over neighbors (all nodes in full attention)
             attn_weights = tf.nn.softmax(attn_scores, axis=-1)
             attn_weights = self.dropout_layer(attn_weights, training=training)
@@ -146,6 +151,7 @@ class GraphAttentionLayerV2(layers.Layer):
             "attn_heads": self.attn_heads,
             "attn_dropout": self.attn_dropout,
             "concat_heads": self.concat_heads,
+            "scale_scores": self.scale_scores,
         })
         return config
 
@@ -364,12 +370,13 @@ class PrevWindowAttentionLayer(layers.Layer):
     """
 
     def __init__(self, units, attn_heads=4, attn_dropout=0.1, msg_units=None,
-                 **kwargs):
+                 scale_scores=False, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.attn_heads = attn_heads
         self.attn_dropout = attn_dropout
         self.msg_units = msg_units or units
+        self.scale_scores = scale_scores
 
     def build(self, input_shape):
         # input_shape is a list: [prev_features_shape, curr_hidden_shape]
@@ -422,6 +429,9 @@ class PrevWindowAttentionLayer(layers.Layer):
                 tf.matmul(pairwise, self.a[head]), axis=-1
             )  # (batch, N, N)
 
+            if self.scale_scores:
+                scores = scores / tf.sqrt(tf.cast(self.units, tf.float32))
+
             attn_weights = tf.nn.softmax(scores, axis=-1)  # (batch, N, N)
             attn_weights = self.dropout_layer(attn_weights, training=training)
 
@@ -451,6 +461,7 @@ class PrevWindowAttentionLayer(layers.Layer):
             "attn_heads": self.attn_heads,
             "attn_dropout": self.attn_dropout,
             "msg_units": self.msg_units,
+            "scale_scores": self.scale_scores,
         })
         return config
 
@@ -588,6 +599,7 @@ def build_lstm_gat_e2e_v3(
     learning_rate: float = 0.001,
     max_gradient_norm: float = 1.0,
     num_gat_layers: int = 1,
+    scale_scores: bool = False,
 ) -> keras.Model:
     """
     Experiment 4a: Per-timestep LSTM-GATv2 WITHOUT residual connection.
@@ -630,6 +642,7 @@ def build_lstm_gat_e2e_v3(
             attn_heads=attn_heads,
             attn_dropout=attn_dropout,
             concat_heads=not is_last,
+            scale_scores=scale_scores,
             name=f"gat_v2_{k}",
         )(x)
         x = layers.ReLU()(x)
@@ -673,6 +686,7 @@ def build_lstm_gat_e2e_v3_prev_window(
     learning_rate: float = 0.001,
     max_gradient_norm: float = 1.0,
     prev_feature_dim: int = None,
+    scale_scores: bool = False,
 ) -> keras.Model:
     """
     Experiment 4b: LSTM-GATv2 with previous-window attention, NO residual.
@@ -721,6 +735,7 @@ def build_lstm_gat_e2e_v3_prev_window(
         attn_heads=attn_heads,
         attn_dropout=attn_dropout,
         msg_units=gat_units,
+        scale_scores=scale_scores,
         name="prev_window_gat",
     )([prev_input, stacked_lstm])
 
@@ -764,11 +779,13 @@ class DynamicMaskedGATv2Layer(layers.Layer):
     adjacency mask is applied at every timestep.
     """
 
-    def __init__(self, units, attn_heads=4, attn_dropout=0.1, **kwargs):
+    def __init__(self, units, attn_heads=4, attn_dropout=0.1, scale_scores=False,
+                 **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.attn_heads = attn_heads
         self.attn_dropout = attn_dropout
+        self.scale_scores = scale_scores
 
     def build(self, input_shape):
         features_shape = input_shape[0]
@@ -834,6 +851,10 @@ class DynamicMaskedGATv2Layer(layers.Layer):
                 tf.matmul(pairwise, self.a[head]), axis=-1
             )
 
+            # Optional sqrt scaling
+            if self.scale_scores:
+                scores = scores / tf.sqrt(tf.cast(self.units, tf.float32))
+
             # Mask non-edges to -inf before softmax
             scores = tf.where(mask > 0, scores, tf.ones_like(scores) * -1e9)
 
@@ -851,6 +872,7 @@ class DynamicMaskedGATv2Layer(layers.Layer):
             "units": self.units,
             "attn_heads": self.attn_heads,
             "attn_dropout": self.attn_dropout,
+            "scale_scores": self.scale_scores,
         })
         return config
 
@@ -866,6 +888,7 @@ def build_lstm_gat_rolling(
     attn_dropout: float = 0.1,
     learning_rate: float = 0.001,
     max_gradient_norm: float = 1.0,
+    scale_scores: bool = False,
 ) -> keras.Model:
     """
     Experiment 4c: LSTM-GATv2 constrained by rolling Pearson adjacency.
@@ -906,6 +929,7 @@ def build_lstm_gat_rolling(
         units=gat_units,
         attn_heads=attn_heads,
         attn_dropout=attn_dropout,
+        scale_scores=scale_scores,
         name="dynamic_masked_gat",
     )([stacked_lstm, adjacency_input])
 
