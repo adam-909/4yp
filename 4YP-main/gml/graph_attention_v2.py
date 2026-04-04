@@ -965,3 +965,345 @@ def build_lstm_gat_rolling(
     model.compile(loss=GraphSharpeLoss(output_size=1), optimizer=adam)
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4cii: Concentrated attention mechanisms
+# ---------------------------------------------------------------------------
+
+def sparsemax(logits, axis=-1):
+    """
+    Sparsemax activation (Martins & Astudillo, 2016) in TensorFlow.
+
+    Projects logits onto the probability simplex, producing sparse outputs
+    where some entries are exactly zero.
+    """
+    z = logits - tf.reduce_mean(logits, axis=axis, keepdims=True)
+    z_sorted = tf.sort(z, axis=axis, direction='DESCENDING')
+
+    dim = tf.shape(z)[-1]
+    range_k = tf.cast(tf.range(1, dim + 1), z.dtype)
+
+    cumsum = tf.cumsum(z_sorted, axis=axis)
+    threshold = (cumsum - 1.0) / range_k
+
+    support = tf.cast(z_sorted > threshold, z.dtype)
+    k_star = tf.reduce_sum(support, axis=axis, keepdims=True)
+    tau = (tf.reduce_sum(z_sorted * support, axis=axis, keepdims=True) - 1.0) / k_star
+
+    return tf.maximum(z - tau, 0.0)
+
+
+def _numpy_sparsemax(logits, axis=-1):
+    """NumPy sparsemax for attention extraction (inference only)."""
+    z = logits - logits.mean(axis=axis, keepdims=True)
+    z_sorted = np.flip(np.sort(z, axis=axis), axis=axis)
+
+    dim = z.shape[axis]
+    range_k = np.arange(1, dim + 1).astype(z.dtype)
+
+    cumsum = np.cumsum(z_sorted, axis=axis)
+    threshold = (cumsum - 1.0) / range_k
+
+    support = (z_sorted > threshold).astype(z.dtype)
+    k_star = support.sum(axis=axis, keepdims=True)
+    tau = (np.sum(z_sorted * support, axis=axis, keepdims=True) - 1.0) / k_star
+
+    return np.maximum(z - tau, 0.0)
+
+
+class ConcentratedGATv2Layer(DynamicMaskedGATv2Layer):
+    """
+    GATv2 layer with configurable attention concentration mechanisms.
+
+    Extends DynamicMaskedGATv2Layer with:
+        - Temperature scaling (temperature < 1 sharpens)
+        - Top-k sparsity (keep only top_k logits before softmax)
+        - Sparsemax (exact zeros via simplex projection)
+        - Power sharpening (raise weights to power > 1 and renormalize)
+
+    Also stores attention weights for entropy regularization.
+    """
+
+    def __init__(self, units, attn_heads=4, attn_dropout=0.1, scale_scores=False,
+                 temperature=1.0, top_k=None, sharpen_power=1.0,
+                 attention_type="softmax", **kwargs):
+        super().__init__(
+            units=units, attn_heads=attn_heads, attn_dropout=attn_dropout,
+            scale_scores=scale_scores, **kwargs,
+        )
+        self.temperature = temperature
+        self.top_k = top_k
+        self.sharpen_power = sharpen_power
+        self.attention_type = attention_type
+
+    def _masked_attention(self, features, adjacency, training):
+        head_outputs = []
+        self._last_attn_weights_list = []
+
+        self_loops = tf.eye(
+            tf.shape(adjacency)[1], batch_shape=[tf.shape(adjacency)[0]]
+        )
+        mask = tf.cast((adjacency + self_loops) > 0, tf.float32)
+
+        for head in range(self.attn_heads):
+            h_src = tf.matmul(features, self.W_src[head])
+            h_dst = tf.matmul(features, self.W_dst[head])
+
+            pairwise = (
+                tf.expand_dims(h_src, 2) + tf.expand_dims(h_dst, 1)
+            )
+            pairwise = tf.nn.leaky_relu(pairwise, alpha=0.2)
+
+            scores = tf.squeeze(
+                tf.matmul(pairwise, self.a[head]), axis=-1
+            )
+
+            if self.scale_scores:
+                scores = scores / tf.sqrt(tf.cast(self.units, tf.float32))
+
+            # Mask non-edges to -inf before attention
+            scores = tf.where(mask > 0, scores, tf.ones_like(scores) * -1e9)
+
+            # Top-k: keep only top_k logits, mask rest to -inf
+            if self.top_k is not None:
+                top_vals, _ = tf.math.top_k(scores, k=self.top_k)
+                kth_val = top_vals[:, :, -1:]  # (batch, nodes, 1)
+                scores = tf.where(scores >= kth_val, scores,
+                                  tf.ones_like(scores) * -1e9)
+
+            # Temperature scaling (applied before softmax/sparsemax)
+            if self.temperature != 1.0:
+                scores = scores / self.temperature
+
+            # Attention activation
+            if self.attention_type == "sparsemax":
+                attn_weights = sparsemax(scores, axis=-1)
+            else:
+                attn_weights = tf.nn.softmax(scores, axis=-1)
+
+            # Power sharpening (post-activation)
+            if self.sharpen_power != 1.0:
+                attn_weights = tf.pow(attn_weights + 1e-9, self.sharpen_power)
+                attn_weights = attn_weights / (
+                    tf.reduce_sum(attn_weights, axis=-1, keepdims=True) + 1e-9
+                )
+
+            self._last_attn_weights_list.append(attn_weights)
+            attn_weights = self.dropout_layer(attn_weights, training=training)
+
+            h_prime = tf.matmul(attn_weights, h_src)
+            head_outputs.append(h_prime)
+
+        # Store for entropy regularization: (batch, heads, nodes, nodes)
+        self.last_attn_weights = tf.stack(self._last_attn_weights_list, axis=1)
+
+        return tf.reduce_mean(tf.stack(head_outputs, axis=-1), axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "sharpen_power": self.sharpen_power,
+            "attention_type": self.attention_type,
+        })
+        return config
+
+
+def build_lstm_gat_rolling_concentrated(
+    num_tickers: int,
+    time_steps: int,
+    input_size: int,
+    hidden_layer_size: int = 32,
+    gat_units: int = 16,
+    attn_heads: int = 4,
+    lstm_dropout: float = 0.3,
+    attn_dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    max_gradient_norm: float = 1.0,
+    scale_scores: bool = False,
+    use_residual: bool = False,
+    # Concentration parameters
+    temperature: float = 1.0,
+    top_k: int = None,
+    sharpen_power: float = 1.0,
+    attention_type: str = "softmax",
+    lambda_entropy: float = 0.0,
+) -> keras.Model:
+    """
+    Experiment 4cii: LSTM-GATv2 with concentrated attention mechanisms.
+
+    Same architecture as build_lstm_gat_rolling but uses ConcentratedGATv2Layer
+    and optionally adds entropy regularization to the loss.
+
+    Additional Args:
+        temperature: Divide logits by T before activation. T<1 sharpens.
+        top_k: Keep only top-k logits per node before activation.
+        sharpen_power: Raise attention weights to this power and renormalize.
+        attention_type: "softmax" or "sparsemax".
+        lambda_entropy: Weight for attention entropy penalty (0 = disabled).
+    """
+    feature_input = keras.Input(
+        shape=(num_tickers, time_steps, input_size), name="features"
+    )
+    adjacency_input = keras.Input(
+        shape=(num_tickers, num_tickers), name="adjacency"
+    )
+
+    shared_lstm = layers.LSTM(
+        hidden_layer_size,
+        return_sequences=True,
+        dropout=lstm_dropout,
+        activation="tanh",
+        recurrent_activation="sigmoid",
+        name="shared_lstm",
+    )
+
+    lstm_outputs = []
+    for i in range(num_tickers):
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(feature_input)
+        lstm_outputs.append(shared_lstm(ticker_slice))
+
+    stacked_lstm = layers.Lambda(lambda t: tf.stack(t, axis=2))(lstm_outputs)
+
+    gat_layer = ConcentratedGATv2Layer(
+        units=gat_units,
+        attn_heads=attn_heads,
+        attn_dropout=attn_dropout,
+        scale_scores=scale_scores,
+        temperature=temperature,
+        top_k=top_k,
+        sharpen_power=sharpen_power,
+        attention_type=attention_type,
+        name="concentrated_gat",
+    )
+
+    x = gat_layer([stacked_lstm, adjacency_input])
+    x = layers.ReLU()(x)
+
+    if use_residual:
+        residual = layers.TimeDistributed(
+            layers.TimeDistributed(
+                layers.Dense(gat_units, activation="linear")
+            )
+        )(stacked_lstm)
+        x = layers.Add()([x, residual])
+
+    output = layers.TimeDistributed(
+        layers.TimeDistributed(
+            layers.Dense(
+                1,
+                activation=tf.nn.tanh,
+                kernel_constraint=keras.constraints.max_norm(3),
+            )
+        )
+    )(x)
+
+    output = layers.Permute((2, 1, 3))(output)
+
+    model = keras.Model(inputs=[feature_input, adjacency_input], outputs=output)
+
+    if lambda_entropy > 0:
+        from gml.graph_model_2_v2 import GraphSharpeLossWithEntropy
+        loss_fn = GraphSharpeLossWithEntropy(
+            output_size=1, gat_layer=gat_layer, lambda_entropy=lambda_entropy,
+        )
+    else:
+        loss_fn = GraphSharpeLoss(output_size=1)
+
+    adam = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=max_gradient_norm)
+    model.compile(loss=loss_fn, optimizer=adam)
+
+    return model
+
+
+def extract_attention_weights_concentrated(
+    model, inputs, gat_layer_name="concentrated_gat", attention_type="softmax",
+):
+    """
+    Extract attention weights from a ConcentratedGATv2Layer.
+
+    Supports softmax and sparsemax attention types, plus top-k, temperature,
+    and power sharpening — mirroring the layer's forward pass in NumPy.
+
+    Returns:
+        attention_weights: np.ndarray (num_samples, num_heads, num_nodes, num_nodes)
+    """
+    gat_layer = model.get_layer(gat_layer_name)
+    W_src = gat_layer.W_src.numpy()
+    W_dst = gat_layer.W_dst.numpy()
+    a = gat_layer.a.numpy()
+    num_heads = W_src.shape[0]
+    temperature = gat_layer.temperature
+    top_k = gat_layer.top_k
+    sharpen_power = gat_layer.sharpen_power
+
+    # Get features and adjacency feeding into the GAT layer
+    gat_input_tensors = gat_layer.input  # list: [features, adjacency]
+    sub_model = keras.Model(inputs=model.input, outputs=gat_input_tensors)
+    gat_inputs = sub_model.predict(inputs, verbose=0)
+    gat_features = gat_inputs[0]
+    gat_adjacency = gat_inputs[1]
+
+    # Use raw adjacency from inputs for masking
+    if isinstance(inputs, (list, tuple)):
+        raw_adjacency = inputs[1] if isinstance(inputs[1], np.ndarray) else inputs[1]
+    else:
+        raw_adjacency = gat_adjacency
+
+    def _apply_attention(scores, mask_2d):
+        """Apply top-k, temperature, activation, and power sharpening."""
+        scores = np.where(mask_2d > 0, scores, -1e9)
+
+        if top_k is not None:
+            kth_vals = np.partition(scores, -top_k, axis=-1)[..., -top_k:]
+            kth_val = kth_vals.min(axis=-1, keepdims=True)
+            scores = np.where(scores >= kth_val, scores, -1e9)
+
+        if temperature != 1.0:
+            scores = scores / temperature
+
+        if attention_type == "sparsemax":
+            attn = _numpy_sparsemax(scores, axis=-1)
+        else:
+            exp_scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            attn = exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-9)
+
+        if sharpen_power != 1.0:
+            attn = np.power(attn + 1e-9, sharpen_power)
+            attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-9)
+
+        return attn
+
+    all_attention = []
+
+    for sample_idx in range(gat_features.shape[0]):
+        sample = gat_features[sample_idx]
+        adj = raw_adjacency[sample_idx] if raw_adjacency.ndim == 3 else raw_adjacency
+        mask = ((adj + np.eye(adj.shape[0])) > 0).astype(np.float32)
+
+        if sample.ndim == 3:
+            head_attns = []
+            for head in range(num_heads):
+                h_src = sample @ W_src[head]
+                h_dst = sample @ W_dst[head]
+                pairwise = h_src[:, :, np.newaxis, :] + h_dst[:, np.newaxis, :, :]
+                pairwise = np.where(pairwise > 0, pairwise, 0.2 * pairwise)
+                scores = (pairwise @ a[head]).squeeze(-1)
+                attn = _apply_attention(scores, mask)
+                head_attns.append(attn.mean(axis=0))
+            all_attention.append(np.stack(head_attns, axis=0))
+        else:
+            head_attns = []
+            for head in range(num_heads):
+                h_src = sample @ W_src[head]
+                h_dst = sample @ W_dst[head]
+                pairwise = h_src[:, np.newaxis, :] + h_dst[np.newaxis, :, :]
+                pairwise = np.where(pairwise > 0, pairwise, 0.2 * pairwise)
+                scores = (pairwise @ a[head]).squeeze(-1)
+                attn = _apply_attention(scores, mask)
+                head_attns.append(attn)
+            all_attention.append(np.stack(head_attns, axis=0))
+
+    return np.stack(all_attention, axis=0)

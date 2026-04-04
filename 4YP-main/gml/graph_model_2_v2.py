@@ -227,3 +227,41 @@ def load_adjacency_matrix(graph_type: str, alpha: float = 0.5, beta: float = 0.5
         adjacency_df = adjacency_df.reindex(index=tickers, columns=tickers)
 
     return adjacency_df.values
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4cii: Entropy-regularized Sharpe loss
+# ---------------------------------------------------------------------------
+
+class GraphSharpeLossWithEntropy(GraphSharpeLoss):
+    """
+    GraphSharpeLoss with an attention entropy penalty.
+
+    Encourages concentrated (low-entropy) attention distributions by adding
+    lambda_entropy * mean_entropy(attention_weights) to the Sharpe loss.
+
+    Args:
+        output_size: Passed to GraphSharpeLoss.
+        gat_layer: A ConcentratedGATv2Layer instance whose .last_attn_weights
+            attribute is read after each forward pass.
+        lambda_entropy: Weight for the entropy penalty term.
+    """
+
+    def __init__(self, output_size: int = 1, gat_layer=None,
+                 lambda_entropy: float = 0.1):
+        super().__init__(output_size=output_size)
+        self.gat_layer = gat_layer
+        self.lambda_entropy = lambda_entropy
+
+    def call(self, y_true, y_pred):
+        sharpe_loss = super().call(y_true, y_pred)
+
+        if self.gat_layer is None or self.lambda_entropy == 0:
+            return sharpe_loss
+
+        # last_attn_weights: (batch*time, heads, nodes, nodes)
+        attn = self.gat_layer.last_attn_weights
+        entropy = -tf.reduce_sum(
+            attn * tf.math.log(attn + 1e-9), axis=-1
+        )
+        return sharpe_loss + self.lambda_entropy * tf.reduce_mean(entropy)
