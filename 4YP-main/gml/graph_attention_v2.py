@@ -977,8 +977,22 @@ def sparsemax(logits, axis=-1):
 
     Projects logits onto the probability simplex, producing sparse outputs
     where some entries are exactly zero.
+
+    Handles masked inputs (entries set to -1e9 or lower) by excluding them
+    from the centering and threshold computation.
     """
-    z = logits - tf.reduce_mean(logits, axis=axis, keepdims=True)
+    # Identify masked entries (set to -1e9 by adjacency masking)
+    valid_mask = tf.cast(logits > -1e8, logits.dtype)
+    n_valid = tf.reduce_sum(valid_mask, axis=axis, keepdims=True)
+    n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
+
+    # Center only over valid entries
+    masked_logits = tf.where(valid_mask > 0, logits, tf.zeros_like(logits))
+    valid_mean = tf.reduce_sum(masked_logits, axis=axis, keepdims=True) / n_valid
+    z = logits - valid_mean
+    # Zero out masked entries so they don't interfere with sorting
+    z = tf.where(valid_mask > 0, z, tf.ones_like(z) * -1e9)
+
     z_sorted = tf.sort(z, axis=axis, direction='DESCENDING')
 
     dim = tf.shape(z)[-1]
@@ -989,14 +1003,25 @@ def sparsemax(logits, axis=-1):
 
     support = tf.cast(z_sorted > threshold, z.dtype)
     k_star = tf.reduce_sum(support, axis=axis, keepdims=True)
+    k_star = tf.maximum(k_star, 1.0)  # avoid division by zero
     tau = (tf.reduce_sum(z_sorted * support, axis=axis, keepdims=True) - 1.0) / k_star
 
-    return tf.maximum(z - tau, 0.0)
+    result = tf.maximum(z - tau, 0.0)
+    # Zero out masked positions
+    return result * valid_mask
 
 
 def _numpy_sparsemax(logits, axis=-1):
     """NumPy sparsemax for attention extraction (inference only)."""
-    z = logits - logits.mean(axis=axis, keepdims=True)
+    # Handle masked entries (set to -1e9 by adjacency masking)
+    valid_mask = (logits > -1e8).astype(logits.dtype)
+    n_valid = np.maximum(valid_mask.sum(axis=axis, keepdims=True), 1.0)
+
+    masked_logits = np.where(valid_mask > 0, logits, 0.0)
+    valid_mean = masked_logits.sum(axis=axis, keepdims=True) / n_valid
+    z = logits - valid_mean
+    z = np.where(valid_mask > 0, z, -1e9)
+
     z_sorted = np.flip(np.sort(z, axis=axis), axis=axis)
 
     dim = z.shape[axis]
@@ -1006,10 +1031,11 @@ def _numpy_sparsemax(logits, axis=-1):
     threshold = (cumsum - 1.0) / range_k
 
     support = (z_sorted > threshold).astype(z.dtype)
-    k_star = support.sum(axis=axis, keepdims=True)
+    k_star = np.maximum(support.sum(axis=axis, keepdims=True), 1.0)
     tau = (np.sum(z_sorted * support, axis=axis, keepdims=True) - 1.0) / k_star
 
-    return np.maximum(z - tau, 0.0)
+    result = np.maximum(z - tau, 0.0)
+    return result * valid_mask
 
 
 class ConcentratedGATv2Layer(DynamicMaskedGATv2Layer):
