@@ -363,6 +363,54 @@ Chain: **during stress → graph is dense + stable → model's performance co-mo
 
 Micro-level analysis (how graph affects individual stock positions) is 5d territory. The macro-level story is sufficient for 5b.
 
+## GAT vs GCN: Position Size and Volatility Decomposition
+
+**Per-year return/vol/Sharpe decomposition:**
+
+| Year | GCN Ret | GCN Vol | GCN Sharpe | GAT Ret | GAT Vol | GAT Sharpe | VIX |
+|---|---|---|---|---|---|---|---|
+| 2017 | 2.28% | 0.83% | 2.74 | 1.29% | 0.41% | **3.17** | 11.1 |
+| 2018 | 0.71% | 1.31% | **0.54** | 0.14% | 0.85% | 0.17 | 16.6 |
+| 2019 | 3.12% | 1.62% | **1.92** | 0.88% | 0.75% | 1.18 | 15.4 |
+| 2020 | 0.48% | 1.94% | 0.25 | 1.14% | 1.08% | **1.05** | 29.3 |
+| 2021 | 1.31% | 1.27% | **1.04** | 0.41% | 0.60% | 0.68 | 19.7 |
+| 2022 | 2.45% | 1.47% | 1.67 | 1.73% | 0.95% | **1.82** | 25.6 |
+
+**Position sizes:** GAT positions are 32-52% smaller than GCN every year.
+
+| Year | GCN mean |pos| | GAT mean |pos| | Difference |
+|---|---|---|---|
+| 2017 | 0.189 | 0.097 | -48.9% |
+| 2018 | 0.139 | 0.096 | -31.5% |
+| 2019 | 0.232 | 0.113 | -51.5% |
+| 2020 | 0.167 | 0.105 | -37.0% |
+| 2021 | 0.161 | 0.089 | -44.9% |
+| 2022 | 0.160 | 0.097 | -39.7% |
+
+**Correction:** 2017 (VIX 11.1) is the calmest year but GAT wins. No clean VIX-based pattern for when GAT wins. The mechanism is position sizing, not market regime.
+
+**What we showed:**
+- GAT takes smaller positions → lower vol → lower returns
+- When GCN's larger positions don't generate proportionally higher returns → GAT wins on Sharpe (2017, 2020, 2022)
+- When GCN's larger positions do generate higher returns → GCN wins (2018, 2019, 2021)
+
+**CORRECTION — GAT attention is NOT more concentrated than GCN:**
+
+Proper concentration metrics (Gini, effective neighbors, max weight) show:
+- Gini: GCN 0.130 > GAT 0.083 — **Pearson weights are MORE unequal**
+- Max weight: GCN 0.079 > GAT 0.071 — **Pearson's top neighbor dominates more**
+- Effective neighbors: nearly identical (37.7 vs 38.0)
+- All differences statistically significant
+
+The earlier "higher std" finding was misleading — std of raw weights reflects scale differences, not concentration. GAT's attention is actually MORE UNIFORM than Pearson within the same mask.
+
+**Revised interpretation:** GAT's lower vol and smaller positions are NOT caused by attention concentration. The mechanism is likely:
+- GAT layer's W_msg projection produces lower-magnitude output features
+- Or the overall attention weight scale is smaller, reducing the aggregated signal magnitude
+- The attention flattening ablation would still be informative: does making attention even more uniform change position sizes?
+
+**What we CAN say:** GAT and GCN use similar attention patterns (both near-uniform within Pearson mask), but GAT produces systematically smaller positions through a different mechanism than attention concentration.
+
 ## Relevance to Thesis
 
 - The concurrent correlation and regime analysis are reportable findings (~1-2 pages)
