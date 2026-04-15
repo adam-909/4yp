@@ -360,3 +360,94 @@ def compute_graph_stats(graphs, threshold=0.02):
         stats["mean_entropy"].append(ent.mean())
 
     return {k: np.array(v) for k, v in stats.items()}
+
+
+def perturb_adjacencies(adjacencies, mode, fraction, base_seed=42):
+    """Perturb each per-window adjacency by adding or removing edges.
+
+    Preserves real edge weights under subtract mode. For add mode, assigns
+    fake edges a weight drawn from the distribution of existing real edge
+    weights at that window. Re-applies symmetric normalisation
+    D^{-1/2}(A+I)D^{-1/2} after perturbation.
+
+    Args:
+        adjacencies: (num_windows, N, N) array of normalised adjacency matrices
+            (as produced by RollingGraphModelFeatures, already symmetrically
+            normalised with self-loops).
+        mode: 'add' or 'subtract'.
+        fraction: float in [0, 1+]. Fraction of current real edges to perturb.
+            - 'subtract': remove round(fraction * current_edges) real edges.
+              At fraction=1.0, all real edges are removed (graph becomes
+              self-loops only after normalisation).
+            - 'add': add round(fraction * current_edges) fake edges.
+              Capped at the number of available non-edge pairs.
+        base_seed: base RNG seed; window_idx is added per window for
+            reproducibility across GCN and GAT runs.
+
+    Returns:
+        Array of same shape as input, re-normalised. Self-loops re-added
+        during normalisation.
+
+    Raises:
+        ValueError: if mode is not 'add' or 'subtract', or fraction < 0.
+    """
+    if mode not in ("add", "subtract"):
+        raise ValueError(f"mode must be 'add' or 'subtract', got {mode!r}")
+    if fraction < 0:
+        raise ValueError(f"fraction must be >= 0, got {fraction}")
+
+    num_windows, n, _ = adjacencies.shape
+    result = np.zeros_like(adjacencies)
+
+    for t in range(num_windows):
+        rng = np.random.default_rng(base_seed + t)
+        A = adjacencies[t].copy()
+        # Work with the off-diagonal, symmetric part
+        A_no_diag = A.copy()
+        np.fill_diagonal(A_no_diag, 0)
+
+        # Find current real edges (upper triangle only, undirected)
+        iu, ju = np.triu_indices(n, k=1)
+        edge_mask = A_no_diag[iu, ju] > 0
+        real_edge_indices = np.where(edge_mask)[0]
+        non_edge_indices = np.where(~edge_mask)[0]
+
+        real_weights = A_no_diag[iu[real_edge_indices], ju[real_edge_indices]]
+        n_real_edges = len(real_edge_indices)
+
+        # Start from current adjacency (off-diagonal, symmetric)
+        new_adj = A_no_diag.copy()
+
+        if mode == "subtract":
+            n_to_remove = int(round(fraction * n_real_edges))
+            n_to_remove = min(n_to_remove, n_real_edges)
+            if n_to_remove > 0:
+                remove_choice = rng.choice(n_real_edges, size=n_to_remove, replace=False)
+                remove_idx = real_edge_indices[remove_choice]
+                i_rem = iu[remove_idx]
+                j_rem = ju[remove_idx]
+                new_adj[i_rem, j_rem] = 0
+                new_adj[j_rem, i_rem] = 0
+
+        elif mode == "add":
+            n_to_add = int(round(fraction * n_real_edges))
+            n_to_add = min(n_to_add, len(non_edge_indices))
+            if n_to_add > 0 and len(real_weights) > 0:
+                add_choice = rng.choice(len(non_edge_indices), size=n_to_add, replace=False)
+                add_idx = non_edge_indices[add_choice]
+                i_add = iu[add_idx]
+                j_add = ju[add_idx]
+                # Sample weights from the distribution of real edge weights
+                sampled_weights = rng.choice(real_weights, size=n_to_add, replace=True)
+                new_adj[i_add, j_add] = sampled_weights
+                new_adj[j_add, i_add] = sampled_weights
+
+        # Re-apply symmetric normalisation: D^{-1/2} (A + I) D^{-1/2}
+        np.fill_diagonal(new_adj, 0)  # ensure no self-loops before adding identity
+        A_with_self = new_adj + np.eye(n)
+        d = A_with_self.sum(axis=1)
+        d_inv_sqrt = np.where(d > 0, 1.0 / np.sqrt(d), 0.0)
+        D_inv_sqrt = np.diag(d_inv_sqrt)
+        result[t] = D_inv_sqrt @ A_with_self @ D_inv_sqrt
+
+    return result
