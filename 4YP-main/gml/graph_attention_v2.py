@@ -780,12 +780,13 @@ class DynamicMaskedGATv2Layer(layers.Layer):
     """
 
     def __init__(self, units, attn_heads=4, attn_dropout=0.1, scale_scores=False,
-                 **kwargs):
+                 kernel_regularizer=None, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.attn_heads = attn_heads
         self.attn_dropout = attn_dropout
         self.scale_scores = scale_scores
+        self.kernel_regularizer = kernel_regularizer
 
     def build(self, input_shape):
         features_shape = input_shape[0]
@@ -794,10 +795,12 @@ class DynamicMaskedGATv2Layer(layers.Layer):
         self.W_src = self.add_weight(
             shape=(self.attn_heads, input_dim, self.units),
             initializer="glorot_uniform", trainable=True, name="W_src",
+            regularizer=self.kernel_regularizer,
         )
         self.W_dst = self.add_weight(
             shape=(self.attn_heads, input_dim, self.units),
             initializer="glorot_uniform", trainable=True, name="W_dst",
+            regularizer=self.kernel_regularizer,
         )
         self.a = self.add_weight(
             shape=(self.attn_heads, self.units, 1),
@@ -873,6 +876,7 @@ class DynamicMaskedGATv2Layer(layers.Layer):
             "attn_heads": self.attn_heads,
             "attn_dropout": self.attn_dropout,
             "scale_scores": self.scale_scores,
+            "kernel_regularizer": keras.regularizers.serialize(self.kernel_regularizer) if self.kernel_regularizer else None,
         })
         return config
 
@@ -890,6 +894,9 @@ def build_lstm_gat_rolling(
     max_gradient_norm: float = 1.0,
     scale_scores: bool = False,
     use_residual: bool = False,
+    recurrent_dropout: float = 0.0,
+    l2_lambda: float = 0.0,
+    feature_dropout: float = 0.0,
 ) -> keras.Model:
     """
     Experiment 4c: LSTM-GATv2 constrained by rolling Pearson adjacency.
@@ -906,6 +913,9 @@ def build_lstm_gat_rolling(
             features: (batch, num_tickers, time_steps, input_size)
             adjacency: (batch, num_tickers, num_tickers)
     """
+    # Set up regularizer if requested
+    kernel_reg = keras.regularizers.l2(l2_lambda) if l2_lambda > 0 else None
+
     feature_input = keras.Input(
         shape=(num_tickers, time_steps, input_size), name="features"
     )
@@ -913,18 +923,28 @@ def build_lstm_gat_rolling(
         shape=(num_tickers, num_tickers), name="adjacency"
     )
 
+    # Optional feature dropout before LSTM
+    if feature_dropout > 0:
+        feat_dropped = layers.TimeDistributed(
+            layers.TimeDistributed(layers.Dropout(feature_dropout))
+        )(feature_input)
+    else:
+        feat_dropped = feature_input
+
     shared_lstm = layers.LSTM(
         hidden_layer_size,
         return_sequences=True,
         dropout=lstm_dropout,
+        recurrent_dropout=recurrent_dropout,
         activation="tanh",
         recurrent_activation="sigmoid",
+        kernel_regularizer=kernel_reg,
         name="shared_lstm",
     )
 
     lstm_outputs = []
     for i in range(num_tickers):
-        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(feature_input)
+        ticker_slice = layers.Lambda(lambda x, idx=i: x[:, idx, :, :])(feat_dropped)
         lstm_outputs.append(shared_lstm(ticker_slice))
 
     stacked_lstm = layers.Lambda(lambda t: tf.stack(t, axis=2))(lstm_outputs)
@@ -934,6 +954,7 @@ def build_lstm_gat_rolling(
         attn_heads=attn_heads,
         attn_dropout=attn_dropout,
         scale_scores=scale_scores,
+        kernel_regularizer=kernel_reg,
         name="dynamic_masked_gat",
     )([stacked_lstm, adjacency_input])
 
